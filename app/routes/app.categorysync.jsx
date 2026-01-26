@@ -21,6 +21,32 @@ import {
  * ======================
  */
 
+function chunk(arr, size = 250) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function addProductsToCollection(admin, { collectionId, productIds }) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation AddProducts($id: ID!, $productIds: [ID!]!) {
+      collectionAddProductsV2(id: $id, productIds: $productIds) {
+        job { id done }
+        userErrors { field message }
+      }
+    }`,
+    { variables: { id: collectionId, productIds } }
+  );
+
+  const json = await res.json();
+  const payload = json?.data?.collectionAddProductsV2;
+  const errs = payload?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+
+  return payload?.job ?? null;
+}
+
 function asInt(value, fallback = null) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -116,6 +142,70 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
+  // sync product
+  if (intent === "sync_products") {
+    const magentoCategoryId = asInt(formData.get("magentoCategoryId"));
+    const collectionId = asString(formData.get("collectionId"));
+
+    if (!magentoCategoryId || !collectionId) {
+      throw new Response("Missing magentoCategoryId/collectionId", { status: 400 });
+    }
+
+    // 1) lấy mapping category -> product_ids_json từ API
+    const res = await fetch("https://dev.megagastrostore.de/rest/V1/shopify/category-products");
+    if (!res.ok) throw new Response("Failed to fetch category-products", { status: 500 });
+
+    const data = await res.json();
+    const items = data?.items ?? [];
+
+    const row = items.find((x) => Number(x.category_id) === Number(magentoCategoryId));
+    if (!row) {
+      return { success: true, added: 0, reason: "No products in this category" };
+    }
+
+    const magentoProductIds = (() => {
+      try {
+        const a = JSON.parse(row.product_ids_json || "[]");
+        return Array.isArray(a) ? a.map(Number).filter(Number.isFinite) : [];
+      } catch {
+        return [];
+      }
+    })();
+
+    if (!magentoProductIds.length) {
+      return { success: true, added: 0, reason: "Empty product list" };
+    }
+
+    // 2) chỉ lấy những product đã sync sang shopify (có shopifyProductId)
+    const mappedProducts = await prisma.productMapMagento.findMany({
+      where: { magentoProductId: { in: magentoProductIds } },
+      select: { magentoProductId: true, shopifyProductId: true },
+    });
+
+    const shopifyProductIds = mappedProducts
+      .map((p) => p.shopifyProductId)
+      .filter(Boolean);
+
+    if (!shopifyProductIds.length) {
+      return { success: true, added: 0, reason: "No synced products yet" };
+    }
+
+    // 3) add products vào collection (chunk 250 để an toàn)
+    const chunks = chunk(shopifyProductIds, 250);
+    const jobs = [];
+    for (const ids of chunks) {
+      const job = await addProductsToCollection(admin, { collectionId, productIds: ids });
+      if (job?.id) jobs.push(job);
+    }
+
+    return {
+      success: true,
+      added: shopifyProductIds.length,
+      totalInCategory: magentoProductIds.length,
+      syncedInDb: shopifyProductIds.length,
+      jobs,
+    };
+  }
   /**
    * FETCH MAGENTO CATEGORIES
    */
@@ -273,13 +363,22 @@ export const action = async ({ request }) => {
 function RowActions({ item, onDone, disabled, shopify }) {
   const syncFetcher = useFetcher();
   const resyncFetcher = useFetcher();
-
+  const syncProductsFetcher = useFetcher();
   const syncing =
     syncFetcher.state === "loading" ||
     syncFetcher.state === "submitting";
   const resyncing =
     resyncFetcher.state === "loading" ||
     resyncFetcher.state === "submitting";
+  const syncingProducts = syncProductsFetcher.state !== "idle";
+
+  useEffect(() => {
+    if (syncProductsFetcher.state === "idle" && syncProductsFetcher.data?.success) {
+      const added = Number(syncProductsFetcher.data?.added || 0);
+      shopify.toast.show(`Synced ${added} products to collection`);
+      onDone();
+    }
+  }, [syncProductsFetcher.state]);
 
   useEffect(() => {
     if (syncFetcher.state === "idle" && syncFetcher.data?.success) {
@@ -307,7 +406,7 @@ function RowActions({ item, onDone, disabled, shopify }) {
   );
 
   return (
-    <InlineStack gap="200">
+    <InlineStack gap="200" wrap={false}>
       <syncFetcher.Form method="post">
         <input type="hidden" name="intent" value="sync" />
         <HiddenFields />
@@ -335,6 +434,26 @@ function RowActions({ item, onDone, disabled, shopify }) {
           Re-sync
         </Button>
       </resyncFetcher.Form>
+      <syncProductsFetcher.Form method="post">
+        <input type="hidden" name="intent" value="sync_products" />
+        <input type="hidden" name="magentoCategoryId" value={item.magentoCategoryId} />
+        <input type="hidden" name="collectionId" value={item.shopifyCollectionId || ""} />
+
+        <Button
+          size="slim"
+          submit
+          loading={syncingProducts}
+          disabled={
+            disabled ||
+            !item.shopifyCollectionId || // ✅ chỉ khi category đã sync
+            syncing ||
+            resyncing ||
+            syncingProducts
+          }
+        >
+          Sync products
+        </Button>
+      </syncProductsFetcher.Form>
     </InlineStack>
   );
 }
