@@ -1,4 +1,5 @@
 // app/routes/app.product.jsx
+import { Pagination, TextField  } from "@shopify/polaris";
 import he from "he";
 import { useFetcher } from "react-router";
 import { useEffect, useState } from "react";
@@ -373,20 +374,53 @@ async function createOrUpdateProductBase(admin, { productId, title, descriptionH
     created: false,
   };
 }
-async function addProductImages(admin, { productId, imageUrl, galleryJson, replaceExisting = false }) {
-  let gallery = safeParseJsonArray(galleryJson).filter(Boolean).map((u) => u.trim());
-  if (imageUrl) gallery = gallery.filter((u) => u !== imageUrl);
 
-  const urls = [...(imageUrl ? [imageUrl] : []), ...gallery].filter(Boolean);
-  if (!urls.length) return;
+async function fetchMagentoProductImages(magentoProductId) {
+  const res = await fetch(
+    `http://dev.megagastrostore.de/rest/V1/shopify/product/${magentoProductId}/images`
+  );
 
-  // 🔥 Resync: xóa ảnh cũ trước
+  if (!res.ok) {
+    throw new Error(`Fetch images failed (${res.status})`);
+  }
+
+  const data = await res.json();
+  console.log(data);
+  // data dạng: ["success", [url1, url2]]
+  const status = data?.[0];
+  const list = data?.[1];
+
+  if (status !== "success") return [];
+  if (!Array.isArray(list)) return [];
+
+  // clean + unique
+  return Array.from(
+    new Set(list.map((u) => String(u || "").trim()).filter(Boolean))
+  );
+}
+async function addProductImages(admin, {
+  productId,
+  magentoProductId,
+  replaceExisting = false,
+}) {
+  // lấy danh sách từ API mới
+  const apiUrls = magentoProductId
+    ? await fetchMagentoProductImages(magentoProductId)
+    : [];
+
+  // nếu vẫn có imageUrl thì đưa lên đầu, và remove trùng trong apiUrls
+  let gallery = apiUrls;
+  // if (imageUrl) gallery = gallery.filter((u) => u !== imageUrl);
+
+  // const urls = [...(imageUrl ? [imageUrl] : []), ...gallery].filter(Boolean);
+  if (!gallery.length) return;
+
   if (replaceExisting) {
     const oldMediaIds = await getProductImageMediaIds(admin, productId);
     await deleteProductMedia(admin, productId, oldMediaIds);
   }
 
-  const media = urls.map((u) => ({
+  const media = gallery.map((u) => ({
     mediaContentType: "IMAGE",
     originalSource: u,
   }));
@@ -405,6 +439,7 @@ async function addProductImages(admin, { productId, imageUrl, galleryJson, repla
   const errs = json?.data?.productCreateMedia?.userErrors ?? [];
   if (errs.length) throw new Error(errs[0].message);
 }
+
 
 /**
  * ======================
@@ -427,7 +462,14 @@ export const action = async ({ request }) => {
    * FETCH MAGENTO PRODUCTS
    */
   if (intent === "fetch") {
-    const res = await fetch("http://dev.megagastrostore.de/rest/V1/shopify/products");
+    const page = Number(formData.get("page")) || 1;
+    const pageSize = Number(formData.get("page_size")) || 500;
+    const url = new URL("http://dev.megagastrostore.de/rest/V1/shopify/products");
+    url.searchParams.set("page", String(page));
+    url.searchParams.set("page_size", String(pageSize));
+    const productId = String(formData.get("product_id") ?? "").trim();
+    if (productId) url.searchParams.set("product_id", productId);
+    const res = await fetch(url.toString());
 
     if (!res.ok) {
       throw new Response("Failed to fetch Magento products", { status: 500 });
@@ -460,7 +502,13 @@ export const action = async ({ request }) => {
       };
     });
 
-    return { items };
+    return {
+      items,
+      page: magento.page ?? page,
+      page_size: magento.page_size ?? pageSize,
+      total: magento.total ?? 0,
+      total_page: magento.total_page ?? 1,
+    };
   }
 
   /**
@@ -535,8 +583,8 @@ export const action = async ({ request }) => {
     // 5) images
     await addProductImages(admin, {
         productId: base.productId,
-        imageUrl,
-        galleryJson,
+        // imageUrl,
+        magentoProductId,
         replaceExisting: intent === "resync",
     });
 
@@ -657,23 +705,50 @@ function RowActions({ item, onDone, disabled, shopify }) {
 export default function ProductPage() {
   const fetcher = useFetcher();
   const shopify = useAppBridge();
-
+  const [page, setPage] = useState(1);
+  const [pageInput, setPageInput] = useState("1");
+  const [searchId, setSearchId] = useState("");
   const [isBulkSyncing, setIsBulkSyncing] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-
+  const [pageInputFocusValue, setPageInputFocusValue] = useState("");
   const items = fetcher.data?.items ?? [];
 
+  
+
   // test sync 10
-  const unsyncedItems = items.filter((i) => !i.isSynced).slice(0, 10);
+  const unsyncedItems = items.filter((i) => !i.isSynced);//.slice(0, 10);
   const allSynced = unsyncedItems.length === 0;
 
-  const handleFetch = () => {
-    fetcher.submit({ intent: "fetch" }, { method: "POST" });
+  const handleFetch = (nextPage = page, nextProductId = searchId) => {
+    if (String(nextProductId || "").trim().length > 0) {
+      nextPage = 1;
+    }
+    setPage(nextPage);
+    fetcher.submit(
+      { intent: "fetch", page: String(nextPage), page_size: "500",product_id: String(nextProductId || "").trim(), },
+      { method: "POST" }
+    );
   };
 
+  const pageInfo = fetcher.data
+  ? {
+      page: fetcher.data.page ?? 1,
+      totalPage: fetcher.data.total_page ?? 1,
+      total: fetcher.data.total ?? 0,
+      pageSize: fetcher.data.page_size ?? 500,
+    }
+  : { page: 1, totalPage: 1, total: 0, pageSize: 500 };
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data?.page != null) {
+      setPage(fetcher.data.page);
+      setPageInput(String(fetcher.data.page));
+    }
+  }, [fetcher.state, fetcher.data?.page]);
+  
   // auto fetch (same as category)
   useEffect(() => {
-    const t = setTimeout(handleFetch, 200);
+    const t = setTimeout(() => handleFetch(1), 200);
     return () => clearTimeout(t);
   }, []);
 
@@ -707,20 +782,60 @@ export default function ProductPage() {
     }
 
     setIsBulkSyncing(false);
-    handleFetch();
+    handleFetch(page);
     shopify.toast.show("All products synced");
   };
 
+  const normalizePage = (raw) => {
+    const total = pageInfo.totalPage || 1;
+    const s = String(raw ?? "").trim();
+    const n = Number(s);
+
+    if (!s) return null;
+    if (!Number.isFinite(n)) return null;
+
+    const p = Math.max(1, Math.min(total, Math.trunc(n)));
+    return p;
+  };
+
+  const goToPage = (raw) => {
+    const p = normalizePage(raw);
+    if (p == null) {
+      // nhập bậy thì reset về trang hiện tại
+      setPageInput(String(pageInfo.page ?? 1));
+      return;
+    }
+
+    const current = Number(pageInfo.page ?? 1);
+    if (p === current) {
+      // không đổi gì thì đừng fetch
+      setPageInput(String(current));
+      return;
+    }
+
+    setPageInput(String(p));
+    handleFetch(p);
+  };
+
+
   return (
-    <Page title="Product Sync">
+    <Page title="Magento → Shopify Products">
       <BlockStack gap="400">
         <Card>
           <InlineStack align="space-between">
-            <Text variant="headingSm">Magento → Shopify Products</Text>
-
+             <div style={{ width: 260 }}>
+                <TextField
+                  labelHidden
+                  label="product id"
+                  placeholder="product id"
+                  value={searchId}
+                  onChange={(v) => setSearchId(v)}
+                  autoComplete="off" 
+                />
+              </div>
             <InlineStack gap="200">
               <Button
-                onClick={handleFetch}
+                onClick={() => handleFetch(page)}
                 loading={fetcher.state !== "idle"}
                 disabled={isBulkSyncing}
               >
@@ -747,7 +862,48 @@ export default function ProductPage() {
             </BlockStack>
           )}
         </Card>
+        {fetcher.data?.total_page > 1 && (
+          <Card>
+            <InlineStack align="space-between" blockAlign="center">
+              <InlineStack gap="200" blockAlign="center">
+                <Text>Page</Text>
 
+                <div style={{ width: 90 }}>
+                  <TextField
+                      labelHidden
+                      label="page"
+                      value={pageInput}
+                      onChange={setPageInput}
+                      autoComplete="off"
+                      onFocus={() => setPageInputFocusValue(pageInput)}
+                      onBlur={() => {
+                        // nếu user không đổi text thì thôi
+                        if (pageInput === pageInputFocusValue) return;
+                        goToPage(pageInput);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          goToPage(pageInput);
+                          e.currentTarget.blur(); // optional: blur để đóng focus
+                        }
+                      }}
+                    />
+                </div>
+
+                <Text>/ {pageInfo.totalPage} — Total {pageInfo.total} items</Text>
+              </InlineStack>
+
+              <Pagination
+                hasPrevious={pageInfo.page > 1}
+                onPrevious={() => handleFetch(pageInfo.page - 1)}
+                hasNext={pageInfo.page < pageInfo.totalPage}
+                onNext={() => handleFetch(pageInfo.page + 1)}
+              />
+            </InlineStack>
+
+          </Card>
+        )}
         {items.length > 0 && (
           <Card padding="0">
             <Scrollable style={{ height: "600px" }}>
@@ -771,14 +927,14 @@ export default function ProductPage() {
                     <IndexTable.Cell>{item.shopifyProductId || "-"}</IndexTable.Cell>
                     <IndexTable.Cell>{item.magentoProductId}</IndexTable.Cell>
                     <IndexTable.Cell>
-                      <div style={{ whiteSpace: "normal", maxWidth: "400px" }}>
+                      <div style={{ whiteSpace: "normal", maxWidth: "300px" }}>
                         <Text>{item.name}</Text>
                       </div>
                     </IndexTable.Cell>
                     <IndexTable.Cell>
                       <RowActions
                         item={item}
-                        onDone={handleFetch}
+                        onDone={() => handleFetch(page)} 
                         disabled={isBulkSyncing}
                         shopify={shopify}
                       />

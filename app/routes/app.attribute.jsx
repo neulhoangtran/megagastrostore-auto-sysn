@@ -45,6 +45,128 @@ function isSelectInput(input) {
   return input === "select" || input === "multiselect";
 }
 
+async function deleteAllMagentoMetafieldDefinitions(admin) {
+  const res = await admin.graphql(
+    `#graphql
+    query($ns: String!) {
+      metafieldDefinitions(ownerType: PRODUCT, first: 250, namespace: $ns) {
+        nodes { id namespace key }
+      }
+    }`,
+    { variables: { ns: NAMESPACE } }
+  );
+
+  const json = await res.json();
+  const defs = json?.data?.metafieldDefinitions?.nodes ?? [];
+
+  let deleted = 0;
+  for (const def of defs) {
+    const delRes = await admin.graphql(
+      `#graphql
+      mutation DeleteDef($id: ID!) {
+        metafieldDefinitionDelete(id: $id, deleteAllAssociatedMetafields: true) {
+          deletedDefinitionId
+          userErrors { message }
+        }
+      }`,
+      { variables: { id: def.id } }
+    );
+
+    const delJson = await delRes.json();
+    const errs = delJson?.data?.metafieldDefinitionDelete?.userErrors ?? [];
+    if (errs.length) throw new Error(errs[0].message);
+
+    deleted += 1;
+  }
+
+  return deleted;
+}
+async function listMagentoMetaobjectDefinitions(admin) {
+  let after = null;
+  const out = [];
+
+  while (true) {
+    const res = await admin.graphql(
+      `#graphql
+      query($after: String) {
+        metaobjectDefinitions(first: 250, after: $after) {
+          pageInfo { hasNextPage endCursor }
+          nodes { id type name }
+        }
+      }`,
+      { variables: { after } }
+    );
+
+    const json = await res.json();
+    const conn = json?.data?.metaobjectDefinitions;
+    const nodes = conn?.nodes ?? [];
+
+    for (const d of nodes) {
+      const t = String(d?.type || "");
+      if (t.startsWith("app")) out.push(d);
+    }
+
+    if (!conn?.pageInfo?.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
+  }
+
+  return out;
+}
+
+
+
+async function bulkDeleteMetaobjectsByType(admin, type) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation BulkDelete($where: MetaobjectBulkDeleteWhereCondition!) {
+      metaobjectBulkDelete(where: $where) {
+        job { id done }
+        userErrors { message }
+      }
+    }`,
+    { variables: { where: { type } } }
+  );
+
+  const json = await res.json();
+  const errs = json?.data?.metaobjectBulkDelete?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+
+  return json?.data?.metaobjectBulkDelete?.job ?? null;
+}
+
+async function deleteMetaobjectDefinitionById(admin, id) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation DeleteDef($id: ID!) {
+      metaobjectDefinitionDelete(id: $id) {
+        deletedId
+        userErrors { message }
+      }
+    }`,
+    { variables: { id } }
+  );
+
+  const json = await res.json();
+  const errs = json?.data?.metaobjectDefinitionDelete?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+
+  return true;
+}
+
+async function deleteAllMagentoMetaobjects(admin) {
+  const defs = await listMagentoMetaobjectDefinitions(admin);
+
+  let deletedDefinitions = 0;
+  for (const d of defs) {
+    await deleteMetaobjectDefinitionById(admin, d.id);
+    deletedDefinitions += 1;
+  }
+
+  return { deletedDefinitions };
+}
+
+
+
 function mapSelectInputToMetafieldType(input) {
   return input === "multiselect"
     ? "list.metaobject_reference"
@@ -499,6 +621,17 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
+  if (intent === "clear_magento_global") {
+    const deletedMetafieldDefinitions = await deleteAllMagentoMetafieldDefinitions(admin);
+    const { deletedDefinitions: deletedMetaobjectDefinitions } =
+      await deleteAllMagentoMetaobjects(admin);
+
+    return {
+      success: true,
+      deletedMetafieldDefinitions,
+      deletedMetaobjectDefinitions,
+    };
+  }
   /**
    * FETCH MAGENTO ATTRIBUTES
    */
@@ -748,6 +881,17 @@ export default function AttributeSyncPage() {
   const unsyncedItems = items.filter((i) => !i.isSynced).slice(0, 50);
   const allSynced = unsyncedItems.length === 0;
 
+  const clearGlobalFetcher = useFetcher();
+
+  useEffect(() => {
+    if (clearGlobalFetcher.state === "idle" && clearGlobalFetcher.data?.success) {
+      const mf = Number(clearGlobalFetcher.data.deletedMetafieldDefinitions || 0);
+      const md = Number(clearGlobalFetcher.data.deletedMetaobjectDefinitions || 0);
+      shopify.toast.show(`Cleared ${mf} metafield defs (magento) + ${md} metaobject defs ($app:magento_*_option)`);
+      handleFetch();
+    }
+  }, [clearGlobalFetcher.state]);
+
   const handleFetch = () => {
     fetcher.submit({ intent: "fetch" }, { method: "POST" });
   };
@@ -799,6 +943,31 @@ export default function AttributeSyncPage() {
   return (
     <Page title="Attribute Sync">
       <BlockStack gap="400">
+        <Card>
+            <InlineStack align="end">
+              <clearGlobalFetcher.Form method="post">
+                <input type="hidden" name="intent" value="clear_magento_global" />
+                <Button
+                  tone="critical"
+                  submit
+                  loading={clearGlobalFetcher.state !== "idle"}
+                  disabled={isBulkSyncing}
+                  onClick={(e) => {
+                    if (
+                      !window.confirm(
+                        "This will DELETE ALL PRODUCT metafield definitions in namespace 'magento' (and their values) AND ALL metaobjects/metaobject definitions of type '$app:magento_*_option'. Continue?"
+                      )
+                    ) {
+                      e.preventDefault();
+                    }
+                  }}
+                >
+                  Clear ALL magento metafields + magento_*_option metaobjects
+                </Button>
+              </clearGlobalFetcher.Form>
+            </InlineStack>
+          </Card>
+
         <Card>
           <InlineStack align="space-between">
             <Text variant="headingSm">Magento → Shopify Attributes</Text>
