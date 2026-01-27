@@ -43,11 +43,402 @@ function decodeMagentoHtml(html) {
   if (!html) return "";
   return he.decode(html);
 }
+
+function chunk(arr, size = 25) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+// =========
+// HTML -> plain text (để tránh lỗi rich_text_field "invalid JSON")
+// =========
+function htmlToPlainText(html, he) {
+  const decoded = he ? he.decode(String(html ?? "")) : String(html ?? "");
+
+  return decoded
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>\s*<p>/gi, "\n\n")
+    .replace(/<\/?p[^>]*>/gi, "")
+    .replace(/<\/?[^>]+>/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Shopify rich_text_field expects JSON document
+function toShopifyRichTextJSONFromHtml(html, he) {
+  const text = htmlToPlainText(html, he);
+  // RichText JSON tối thiểu: 1 paragraph
+  return JSON.stringify({
+    type: "root",
+    children: [
+      {
+        type: "paragraph",
+        children: text ? [{ type: "text", value: text }] : [],
+      },
+    ],
+  });
+}
+
+// =========
+// Magento API: product attributes
+// =========
+async function fetchMagentoProductAttributes(magentoProductId) {
+  const res = await fetch(
+    `http://dev.megagastrostore.de/rest/V1/shopify/product/${magentoProductId}/attributes`
+  );
+  if (!res.ok) throw new Error(`Fetch attributes failed (${res.status})`);
+
+  const json = await res.json();
+  if (json?.status !== "success") return [];
+  return Array.isArray(json?.items) ? json.items : [];
+}
+
+// =========
+// Shopify GraphQL: metaobject definitions (paginate)
+// =========
+async function listAllMetaobjectDefinitions(admin) {
+  const out = [];
+  let after = null;
+
+  while (true) {
+    const res = await admin.graphql(
+      `#graphql
+      query($after: String) {
+        metaobjectDefinitions(first: 250, after: $after) {
+          pageInfo { hasNextPage endCursor }
+          nodes { id type name }
+        }
+      }`,
+      { variables: { after } }
+    );
+
+    const json = await res.json();
+    const payload = json?.data?.metaobjectDefinitions;
+    const nodes = payload?.nodes ?? [];
+    out.push(...nodes);
+
+    if (!payload?.pageInfo?.hasNextPage) break;
+    after = payload.pageInfo.endCursor;
+  }
+
+  return out;
+}
+
+// handle DB của bạn đang lưu dạng "$app:magento_color_option"
+// nhưng Shopify trả type thật dạng "app--xxxx--magento_color_option"
+function resolveMetaobjectTypeFromHandle(defs, handle) {
+  const h = String(handle ?? "").trim();
+  if (!h) return null;
+
+  const suffix = h.startsWith("$app:")
+    ? h.replace("$app:", "") // "magento_color_option"
+    : h;                     // nếu bạn lưu sẵn "app--...--magento_color_option"
+
+  // match theo hậu tố
+  const found = defs.find((d) => String(d?.type ?? "").endsWith(suffix));
+  return found?.type ?? null;
+}
+
+// =========
+// Shopify GraphQL: metaobjects entries map(label/value -> id) (paginate)
+// =========
+async function getMetaobjectOptionIdMap(admin, { metaobjectType, cache }) {
+  if (cache?.has(metaobjectType)) return cache.get(metaobjectType);
+
+  const map = new Map();
+  let after = null;
+
+  while (true) {
+    const res = await admin.graphql(
+      `#graphql
+      query($type: String!, $after: String) {
+        metaobjects(type: $type, first: 250, after: $after) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            fields { key value }
+          }
+        }
+      }`,
+      { variables: { type: metaobjectType, after } }
+    );
+
+    const json = await res.json();
+    const payload = json?.data?.metaobjects;
+    const nodes = payload?.nodes ?? [];
+
+    for (const n of nodes) {
+      const label = n.fields?.find((f) => f.key === "label")?.value;
+      const value = n.fields?.find((f) => f.key === "value")?.value;
+
+      if (label) map.set(String(label).trim(), n.id);
+      if (value) map.set(String(value).trim(), n.id);
+    }
+
+    if (!payload?.pageInfo?.hasNextPage) break;
+    after = payload.pageInfo.endCursor;
+  }
+
+  cache?.set(metaobjectType, map);
+  return map;
+}
+
+// =========
+// Shopify GraphQL: metafieldsSet (chunked outside)
+// =========
+async function metafieldsSet(admin, metafields) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }`,
+    { variables: { metafields } }
+  );
+
+  const json = await res.json();
+  const errs = json?.data?.metafieldsSet?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+}
+
+async function syncMagentoCustomAttributesToProductMetafields(admin, {
+  magentoProductId,
+  shopifyProductId,
+  heLib, // truyền `he` vào cho tiện
+}) {
+  // 1) fetch Magento custom attributes
+  const attrs = await fetchMagentoProductAttributes(magentoProductId);
+  if (!attrs.length) return { updated: 0 };
+
+  // 2) load mapping table: AttributeMapMetafield
+  const maps = await prisma.attributeMapMetafield.findMany({
+    where: { shopifyNamespace: "magento" },
+    select: {
+      magentoAttributeCode: true,
+      shopifyNamespace: true,
+      shopifyKey: true,
+      shopifyType: true,      // boolean / single_line_text_field / rich_text_field / metaobject_reference / list.metaobject_reference...
+      metaobjectHandle: true, // "$app:magento_color_option"
+    },
+  });
+
+  const mapByCode = new Map(maps.map((m) => [m.magentoAttributeCode, m]));
+
+  // 3) metaobject defs cache (resolve type thật)
+  const defs = await listAllMetaobjectDefinitions(admin);
+  const metaobjectOptionCache = new Map(); // realType -> Map(label/value -> id)
+
+  // 4) build metafields inputs
+  const mfInputs = [];
+
+  for (const a of attrs) {
+    const code = String(a?.attribute_code ?? "").trim();
+    if (!code) continue;
+
+    const m = mapByCode.get(code);
+    if (!m?.shopifyKey || !m?.shopifyType) continue;
+
+    const type = m.shopifyType;
+    const ns = m.shopifyNamespace || "magento";
+    const key = m.shopifyKey;
+
+    // ---- metaobject reference (select/multiselect) ----
+    if (type === "metaobject_reference" || type === "list.metaobject_reference") {
+      const handle = m.metaobjectHandle;
+      if (!handle) continue;
+
+      const realType = resolveMetaobjectTypeFromHandle(defs, handle);
+      if (!realType) continue;
+
+      const optionMap = await getMetaobjectOptionIdMap(admin, {
+        metaobjectType: realType,
+        cache: metaobjectOptionCache,
+      });
+
+      const raw = pickMagentoValue(a);
+
+      if (type === "metaobject_reference") {
+        const id = optionMap.get(raw) || optionMap.get(String(a?.value ?? "").trim());
+        if (!id) continue;
+
+        mfInputs.push({
+          ownerId: shopifyProductId,
+          namespace: ns,
+          key,
+          type,
+          value: id,
+        });
+      } else {
+        const parts = splitMulti(a?.value_label ?? a?.value);
+        const ids = parts
+          .map((p) => optionMap.get(p) || optionMap.get(String(p)))
+          .filter(Boolean);
+
+        if (!ids.length) continue;
+
+        mfInputs.push({
+          ownerId: shopifyProductId,
+          namespace: ns,
+          key,
+          type,
+          value: JSON.stringify(ids),
+        });
+      }
+
+      continue;
+    }
+
+    // ---- boolean ----
+    if (type === "boolean") {
+      mfInputs.push({
+        ownerId: shopifyProductId,
+        namespace: ns,
+        key,
+        type,
+        value: toBooleanString(a?.value),
+      });
+      continue;
+    }
+
+    // ---- rich_text_field (ví dụ short_description) ----
+    if (type === "rich_text_field") {
+      const html = String(a?.value ?? "");
+      const jsonRichText = toShopifyRichTextJSONFromHtml(html, heLib);
+      mfInputs.push({
+        ownerId: shopifyProductId,
+        namespace: ns,
+        key,
+        type,
+        value: jsonRichText, // ✅ phải là JSON string
+      });
+      continue;
+    }
+
+    // ---- list.single_line_text_field ----
+    if (type === "list.single_line_text_field") {
+      const parts = splitMulti(pickMagentoValue(a));
+      if (!parts.length) continue;
+      mfInputs.push({
+        ownerId: shopifyProductId,
+        namespace: ns,
+        key,
+        type,
+        value: JSON.stringify(parts),
+      });
+      continue;
+    }
+
+    // ---- default text/textarea/number_decimal/... ----
+    const v = pickMagentoValue(a);
+    if (!v) continue;
+
+    mfInputs.push({
+      ownerId: shopifyProductId,
+      namespace: ns,
+      key,
+      type,
+      value: v,
+    });
+  }
+
+  if (!mfInputs.length) return { updated: 0 };
+
+  // 5) metafieldsSet theo chunk
+  const batches = chunk(mfInputs, 25);
+  for (const batch of batches) {
+    await metafieldsSet(admin, batch);
+  }
+
+  return { updated: mfInputs.length };
+}
+
 /**
  * ======================
  * SHOPIFY HELPERS
  * ======================
  */
+function toBooleanString(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" ? "true" : "false";
+}
+
+// dùng cho text/textarea/number...
+function pickMagentoValue(attr) {
+  // ưu tiên value_label nếu có (select thường có label)
+  const v = attr?.value_label ?? attr?.value;
+  return v == null ? "" : String(v);
+}
+
+// multiselect thường trả "1,2,3" hoặc label "A,B,C"
+function splitMulti(v) {
+  return String(v ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function mapWeightUnit(unit) {
+  const u = String(unit || "").toLowerCase();
+  if (u === "g" || u === "gram" || u === "grams") return "GRAMS";
+  if (u === "oz" || u === "ounce" || u === "ounces") return "OUNCES";
+  if (u === "lb" || u === "lbs" || u === "pound" || u === "pounds") return "POUNDS";
+  // default
+  return "KILOGRAMS";
+}
+
+
+async function updateInventoryItemWeight(admin, { inventoryItemId, weight, weightUnit = "kg" }) {
+  const w = Number(weight);
+  if (!inventoryItemId) return;
+  if (!Number.isFinite(w)) return;
+
+  const res = await admin.graphql(
+    `#graphql
+    mutation UpdateInvItem($id: ID!, $input: InventoryItemInput!) {
+      inventoryItemUpdate(id: $id, input: $input) {
+        inventoryItem { id }
+        userErrors { field message }
+      }
+    }`,
+    {
+      variables: {
+        id: inventoryItemId,
+        input: {
+          measurement: {
+            weight: {
+              value: w,
+              unit: mapWeightUnit(weightUnit), // KILOGRAMS/GRAMS/OUNCES/POUNDS
+            },
+          },
+        },
+      },
+    }
+  );
+
+  const json = await res.json();
+  const errs = json?.data?.inventoryItemUpdate?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+}
+async function setInventoryTracked(admin, { inventoryItemId, tracked = true }) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation SetTracked($id: ID!, $input: InventoryItemInput!) {
+      inventoryItemUpdate(id: $id, input: $input) {
+        inventoryItem { id tracked }
+        userErrors { message }
+      }
+    }`,
+    { variables: { id: inventoryItemId, input: { tracked } } }
+  );
+
+  const json = await res.json();
+  const errs = json?.data?.inventoryItemUpdate?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+
+  return json?.data?.inventoryItemUpdate?.inventoryItem ?? null;
+}
+
 
 async function getProductImageMediaIds(admin, productId) {
   const res = await admin.graphql(
@@ -189,30 +580,6 @@ async function setInventoryOnHand(admin, { inventoryItemId, locationId, quantity
   const json = await res.json();
   const errs = json?.data?.inventorySetOnHandQuantities?.userErrors ?? [];
   if (errs.length) throw new Error(errs[0].message);
-}
-async function updateVariantWeightREST(session, {
-  variantId,
-  weight,
-  weightUnit = "kg",
-}) {
-//   if (!variantId) return;
-
-//   const res = await shopify.api.rest.Variant.update({
-//     session,
-//     id: Number(variantId),
-//     weight: Number(weight),
-//     weight_unit: "kg",
-//   });
-
-//   if (!res?.variant) {
-//     throw new Error("Update variant weight failed: empty response");
-//   }
-
-//   return {
-//     id: res.variant.id,
-//     weight: res.variant.weight,
-//     unit: res.variant.weight_unit,
-//   };
 }
 
 async function updateInventoryItemSku(admin, { inventoryItemId, sku }) {
@@ -457,7 +824,7 @@ export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
-
+  const locationId = await getFirstLocationId(admin);
   /**
    * FETCH MAGENTO PRODUCTS
    */
@@ -525,8 +892,8 @@ export const action = async ({ request }) => {
     const description = decodeMagentoHtml(descriptionRaw);
     const metaTitle = asString(formData.get("metaTitle"));
     const metaDescription = asString(formData.get("metaDescription"));
-    const imageUrl = asString(formData.get("imageUrl"));
-    const galleryJson = asString(formData.get("galleryJson"));
+    // const imageUrl = asString(formData.get("imageUrl"));
+    // const galleryJson = asString(formData.get("galleryJson"));
 
     if (!magentoProductId || !name) {
       throw new Response("Missing required fields", { status: 400 });
@@ -564,20 +931,32 @@ export const action = async ({ request }) => {
       sku,
     });
 
+    await updateInventoryItemWeight(admin, {
+      inventoryItemId: base.inventoryItemId,
+      weight,          // lấy từ formData (Magento)
+      weightUnit: "kg" // hoặc nếu sau này bạn có unit từ Magento thì truyền vào
+    });
+
     // 4) inventory on hand
     const locationId = await getFirstLocationId(admin);
 
-    // 🔥 BẮT BUỘC activate trước
-    await activateInventoryItem(admin, {
-        inventoryItemId: base.inventoryItemId,
-        locationId,
+    // ✅ 4.0) bật tracking để Shopify theo dõi tồn kho (hết "Inventory not tracked")
+    await setInventoryTracked(admin, {
+      inventoryItemId: base.inventoryItemId,
+      tracked: true,
     });
 
-    // set on hand
+    // 🔥 4.1) BẮT BUỘC activate trước khi set quantity
+    await activateInventoryItem(admin, {
+      inventoryItemId: base.inventoryItemId,
+      locationId,
+    });
+
+    // 4.2) set on hand
     await setInventoryOnHand(admin, {
-        inventoryItemId: base.inventoryItemId,
-        locationId,
-        quantity: qty,
+      inventoryItemId: base.inventoryItemId,
+      locationId,
+      quantity: qty,
     });
 
     // 5) images
@@ -586,6 +965,12 @@ export const action = async ({ request }) => {
         // imageUrl,
         magentoProductId,
         replaceExisting: intent === "resync",
+    });
+
+    await syncMagentoCustomAttributesToProductMetafields(admin, {
+      magentoProductId,
+      shopifyProductId: base.productId,
+      heLib: he, // bạn đã import he
     });
 
     // 6) publish product

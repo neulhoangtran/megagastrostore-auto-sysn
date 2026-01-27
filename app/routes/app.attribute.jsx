@@ -26,18 +26,21 @@ const NAMESPACE = "magento";
 const MAGENTO_ATTR_API =
   "http://dev.megagastrostore.de/rest/V1/shopify/product_attr";
 
-function mapMagentoInputToShopifyType(frontendInput) {
+function mapMagentoInputToShopifyType(frontendInput, attributeCode) {
+  // ưu tiên theo code
+  if (attributeCode === "short_description") return "rich_text_field";
+
   const map = {
     text: "single_line_text_field",
-    textarea: "multi_line_text_field",
+    textarea: "multi_line_text_field", // default
     varchar: "single_line_text_field",
     price: "number_decimal",
     decimal: "number_decimal",
-    // select/multiselect handled separately (metaobject reference)
     select: "single_line_text_field",
     multiselect: "list.single_line_text_field",
     boolean: "boolean",
   };
+
   return map[frontendInput] || null;
 }
 
@@ -656,7 +659,7 @@ export const action = async ({ request }) => {
         input: a.frontend_input,
         expectedShopifyType: isSelectInput(a.frontend_input)
           ? mapSelectInputToMetafieldType(a.frontend_input)
-          : mapMagentoInputToShopifyType(a.frontend_input),
+          : mapMagentoInputToShopifyType(a.frontend_input, a.attribute_code),
 
         shopifyNamespace: map?.shopifyNamespace ?? null,
         shopifyKey: map?.shopifyKey ?? null,
@@ -719,7 +722,7 @@ export const action = async ({ request }) => {
 
       metaobjectOptionsCreated = result.created || 0;
     } else {
-      shopifyType = mapMagentoInputToShopifyType(input);
+      shopifyType = mapMagentoInputToShopifyType(input, code);
       if (!shopifyType) {
         throw new Error(`Unsupported attribute type: ${input}`);
       }
@@ -878,7 +881,7 @@ export default function AttributeSyncPage() {
   const [progress, setProgress] = useState({ done: 0, total: 0 });
 
   const items = fetcher.data?.items ?? [];
-  const unsyncedItems = items.filter((i) => !i.isSynced).slice(0, 50);
+  const unsyncedItems = items.filter((i) => !i.isSynced);
   const allSynced = unsyncedItems.length === 0;
 
   const clearGlobalFetcher = useFetcher();
