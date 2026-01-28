@@ -22,6 +22,7 @@ export default function App() {
         <s-link href="/app/categorysync">Category Sync</s-link>
         <s-link href="/app/product">Product Sync</s-link>
         <s-link href="/app/attribute">Attribute Sync</s-link>
+        <s-link href="/app/settings">Settings</s-link>
       </s-app-nav>
       <Outlet />
     </AppProvider>
