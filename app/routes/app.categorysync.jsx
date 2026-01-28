@@ -2,6 +2,7 @@ import { useFetcher } from "react-router";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import { getSettingOr } from "../utils/settings";
 import prisma from "../db.server";
 import {
   Page,
@@ -142,6 +143,21 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
+  const intentsNeedMagento = new Set(["fetch", "sync", "resync"]);
+    let MAGENTO_BASE = null;
+  
+    if (intentsNeedMagento.has(intent)) {
+      MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+  
+      if (!MAGENTO_BASE) {
+        return {
+          success: false,
+          error: "PLEASE_SETUP_MAGENTO_URL",
+          message: "Please setup url",
+        };
+      }
+    }
+
   // sync product
   if (intent === "sync_products") {
     const magentoCategoryId = asInt(formData.get("magentoCategoryId"));
@@ -152,7 +168,7 @@ export const action = async ({ request }) => {
     }
 
     // 1) lấy mapping category -> product_ids_json từ API
-    const res = await fetch("https://dev.megagastrostore.de/rest/V1/shopify/category-products");
+    const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/category-products`);
     if (!res.ok) throw new Response("Failed to fetch category-products", { status: 500 });
 
     const data = await res.json();
@@ -211,7 +227,7 @@ export const action = async ({ request }) => {
    */
   if (intent === "fetch") {
     const res = await fetch(
-      "http://dev.megagastrostore.de/rest/V1/shopify/categories"
+      `${MAGENTO_BASE}/rest/V1/shopify/categories`
     );
 
     if (!res.ok) {

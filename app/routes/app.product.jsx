@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
+import { getSettingOr } from "../utils/settings";
 import {
   Page,
   Card,
@@ -82,9 +83,9 @@ function toShopifyRichTextJSONFromHtml(html, he) {
 // =========
 // Magento API: product attributes
 // =========
-async function fetchMagentoProductAttributes(magentoProductId) {
+async function fetchMagentoProductAttributes(magentoUrl, magentoProductId) {
   const res = await fetch(
-    `http://dev.megagastrostore.de/rest/V1/shopify/product/${magentoProductId}/attributes`
+    `${magentoUrl}/rest/V1/shopify/product/${magentoProductId}/attributes`
   );
   if (!res.ok) throw new Error(`Fetch attributes failed (${res.status})`);
 
@@ -202,13 +203,13 @@ async function metafieldsSet(admin, metafields) {
   if (errs.length) throw new Error(errs[0].message);
 }
 
-async function syncMagentoCustomAttributesToProductMetafields(admin, {
+async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin, {
   magentoProductId,
   shopifyProductId,
   heLib, // truyền `he` vào cho tiện
 }) {
   // 1) fetch Magento custom attributes
-  const attrs = await fetchMagentoProductAttributes(magentoProductId);
+  const attrs = await fetchMagentoProductAttributes(magentoUrl, magentoProductId);
   if (!attrs.length) return { updated: 0 };
 
   // 2) load mapping table: AttributeMapMetafield
@@ -742,9 +743,9 @@ async function createOrUpdateProductBase(admin, { productId, title, descriptionH
   };
 }
 
-async function fetchMagentoProductImages(magentoProductId) {
+async function fetchMagentoProductImages(magentoUrl, magentoProductId) {
   const res = await fetch(
-    `http://dev.megagastrostore.de/rest/V1/shopify/product/${magentoProductId}/images`
+    `${magentoUrl}/rest/V1/shopify/product/${magentoProductId}/images`
   );
 
   if (!res.ok) {
@@ -765,14 +766,14 @@ async function fetchMagentoProductImages(magentoProductId) {
     new Set(list.map((u) => String(u || "").trim()).filter(Boolean))
   );
 }
-async function addProductImages(admin, {
+async function addProductImages(magentoUrl, admin, {
   productId,
   magentoProductId,
   replaceExisting = false,
 }) {
   // lấy danh sách từ API mới
   const apiUrls = magentoProductId
-    ? await fetchMagentoProductImages(magentoProductId)
+    ? await fetchMagentoProductImages(magentoUrl, magentoProductId)
     : [];
 
   // nếu vẫn có imageUrl thì đưa lên đầu, và remove trùng trong apiUrls
@@ -825,13 +826,29 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
   const locationId = await getFirstLocationId(admin);
+
+  const intentsNeedMagento = new Set(["fetch", "sync", "resync"]);
+  let MAGENTO_BASE = null;
+
+  if (intentsNeedMagento.has(intent)) {
+    MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+
+    if (!MAGENTO_BASE) {
+      return {
+        success: false,
+        error: "PLEASE_SETUP_MAGENTO_URL",
+        message: "Please setup url",
+      };
+    }
+  }
+  
   /**
    * FETCH MAGENTO PRODUCTS
    */
   if (intent === "fetch") {
     const page = Number(formData.get("page")) || 1;
     const pageSize = Number(formData.get("page_size")) || 500;
-    const url = new URL("http://dev.megagastrostore.de/rest/V1/shopify/products");
+    const url = new URL(`${MAGENTO_BASE}/rest/V1/shopify/products`);
     url.searchParams.set("page", String(page));
     url.searchParams.set("page_size", String(pageSize));
     const productId = String(formData.get("product_id") ?? "").trim();
@@ -960,14 +977,14 @@ export const action = async ({ request }) => {
     });
 
     // 5) images
-    await addProductImages(admin, {
+    await addProductImages(MAGENTO_BASE, admin, {
         productId: base.productId,
         // imageUrl,
         magentoProductId,
         replaceExisting: intent === "resync",
     });
 
-    await syncMagentoCustomAttributesToProductMetafields(admin, {
+    await syncMagentoCustomAttributesToProductMetafields(MAGENTO_BASE, admin, {
       magentoProductId,
       shopifyProductId: base.productId,
       heLib: he, // bạn đã import he

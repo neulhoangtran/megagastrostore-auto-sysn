@@ -1,61 +1,76 @@
 // app/routes/app.settings.jsx
 import { useEffect, useMemo, useState } from "react";
 import { useFetcher, useLoaderData } from "react-router";
-import { authenticate } from "../shopify.server";
-import prisma from "../db.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import {
   Page,
   Card,
-  Text,
   TextField,
   Button,
-  InlineStack,
   BlockStack,
+  InlineStack,
+  Text,
   Banner,
-  Divider,
 } from "@shopify/polaris";
 
-/**
- * ======================
- * DB HELPERS (NO SHOP)
- * ======================
- */
-async function getSetting(key, fallback = "") {
-  const row = await prisma.appSetting.findUnique({ where: { key } });
-  return row?.value ?? fallback;
-}
-
-async function setSetting(key, value) {
-  await prisma.appSetting.upsert({
-    where: { key },
-    create: { key, value: String(value ?? "") },
-    update: { value: String(value ?? "") },
-  });
-}
+import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
 
 /**
  * ======================
- * UTILS
+ * DB NOTE (Prisma)
  * ======================
+ * Bạn cần có table key/value để tự động lưu mọi field.
+ *
+ * model AppSetting {
+ *   key       String  @id
+ *   value     String
+ *   createdAt DateTime @default(now())
+ *   updatedAt DateTime @updatedAt
+ * }
  */
-function chunk(arr, size = 200) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
+
+/**
+ * ======================
+ * SETTINGS FIELDS (UI)
+ * ======================
+ * ✅ Muốn thêm field mới: chỉ cần thêm object vào đây (không phải sửa loader/action).
+ */
+const FIELDS = [
+  {
+    key: "magento_url",
+    label: "Magento base URL",
+    placeholder: "https://dev.megagastrostore.de",
+    helpText: "https//sample.com",
+  },
+  // {
+  //   key: "magento_push_endpoint",
+  //   label: "Magento push endpoint",
+  //   placeholder: "/rest/V1/shopify/product-map",
+  //   helpText: "Endpoint nhận mapping (Magento sẽ tự xử lý).",
+  // },
+  // {
+  //   key: "magento_token",
+  //   label: "Magento token (optional)",
+  //   placeholder: "Bearer token (nếu endpoint cần auth)",
+  //   type: "password",
+  //   helpText: "Để trống nếu Magento không cần auth.",
+  // },
+];
 
 function normalizeBaseUrl(url) {
-  const s = String(url || "").trim();
-  return s.endsWith("/") ? s.slice(0, -1) : s;
+  const u = String(url || "").trim();
+  return u.endsWith("/") ? u.slice(0, -1) : u;
 }
 
 function joinUrl(base, path) {
   const b = normalizeBaseUrl(base);
   const p = String(path || "").trim();
+  if (!b) return p || "";
   if (!p) return b;
-  if (p.startsWith("http")) return p;
-  return p.startsWith("/") ? `${b}${p}` : `${b}/${p}`;
+  if (p.startsWith("http://") || p.startsWith("https://")) return p;
+  if (p.startsWith("/")) return `${b}${p}`;
+  return `${b}/${p}`;
 }
 
 /**
@@ -63,18 +78,21 @@ function joinUrl(base, path) {
  * SERVER
  * ======================
  */
+
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
 
-  const magentoUrl = await getSetting("magento_url", "https://dev.megagastrostore.de");
-  const magentoEndpoint = await getSetting("magento_push_endpoint", "/rest/V1/shopify/product-map");
-  const magentoToken = await getSetting("magento_token", ""); // optional
+  const rows = await prisma.appSetting.findMany();
+  const settings = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+
+  const mapCount = await prisma.productMapMagento.count();
 
   return {
-    magentoUrl,
-    magentoEndpoint,
-    // do NOT leak token to UI
-    hasToken: Boolean(magentoToken),
+    settings,
+    mapCount,
+    // optional: show last push info if stored
+    lastPushAt: settings.last_push_at || null,
+    lastPushResult: settings.last_push_result || null,
   };
 };
 
@@ -84,89 +102,129 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
 
+  // ===== SAVE SETTINGS (generic) =====
   if (intent === "save_settings") {
-    const magentoUrl = String(formData.get("magentoUrl") || "").trim();
-    const magentoEndpoint = String(formData.get("magentoEndpoint") || "").trim();
-    const magentoToken = String(formData.get("magentoToken") || "").trim(); // optional
+    const pairs = [...formData.entries()]
+      .filter(([k]) => String(k).startsWith("s_"))
+      .map(([k, v]) => [String(k).slice(2), String(v ?? "")]);
 
-    if (!magentoUrl) throw new Response("Missing magentoUrl", { status: 400 });
+    // upsert in 1 transaction
+    await prisma.$transaction(
+      pairs.map(([key, value]) =>
+        prisma.appSetting.upsert({
+          where: { key },
+          create: { key, value },
+          update: { value },
+        })
+      )
+    );
 
-    await setSetting("magento_url", magentoUrl);
-    await setSetting("magento_push_endpoint", magentoEndpoint || "/rest/V1/shopify/product-map");
-
-    // chỉ update token khi user nhập (để khỏi overwrite thành rỗng)
-    if (magentoToken) {
-      await setSetting("magento_token", magentoToken);
-    }
-
-    return { success: true, intent };
+    return { success: true };
   }
 
-  if (intent === "push_mapping") {
-    const magentoUrl = await getSetting("magento_url", "");
-    const magentoEndpoint = await getSetting("magento_push_endpoint", "/rest/V1/shopify/product-map");
-    const magentoToken = await getSetting("magento_token", "");
+  // ===== PUSH PRODUCT MAP TO MAGENTO =====
+  if (intent === "push_product_map") {
+    // load settings from DB
+    const rows = await prisma.appSetting.findMany({
+      where: { key: { in: ["magento_url", "magento_push_endpoint", "magento_token"] } },
+    });
+    const settings = Object.fromEntries(rows.map((r) => [r.key, r.value]));
 
-    if (!magentoUrl) {
-      return { success: false, intent, message: "Magento URL is empty. Please save settings first." };
+    const magentoUrl = settings.magento_url || "";
+    const endpoint = "/V1/shopify/get-list-shopify-product-id";
+    const token = settings.magento_token || "";
+
+    const targetUrl = joinUrl(magentoUrl, endpoint);
+
+    if (!targetUrl) {
+      return {
+        success: false,
+        error: "Missing magento_url or magento_push_endpoint",
+      };
     }
 
-    // lấy mapping từ DB app
     const maps = await prisma.productMapMagento.findMany({
       select: {
         magentoProductId: true,
         shopifyProductId: true,
         sku: true,
         name: true,
-        updatedAt: true,
       },
       orderBy: { magentoProductId: "asc" },
     });
 
-    const items = maps.map((m) => ({
-      magento_product_id: m.magentoProductId,
-      shopify_product_id: m.shopifyProductId,
-      sku: m.sku,
-      name: m.name,
-      updated_at: m.updatedAt,
-    }));
+    // payload tối giản: chỉ cần id mapping
+    const payload = {
+      status: "success",
+      total: maps.length,
+      items: maps.map((m) => ({
+        magento_product_id: m.magentoProductId,
+        shopify_product_id: m.shopifyProductId,
+        sku: m.sku || null,
+        name: m.name || null,
+      })),
+    };
 
-    if (!items.length) {
-      return { success: true, intent, pushed: 0, message: "No mapping rows found." };
+    const headers = { "Content-Type": "application/json" };
+    if (token && token.trim()) {
+      // nếu Magento bạn dùng Bearer token, bạn nhập thẳng "Bearer xxx" vào field.
+      headers["Authorization"] = token.trim();
     }
 
-    const url = joinUrl(magentoUrl, magentoEndpoint);
+    let ok = false;
+    let respText = "";
+    let statusCode = 0;
 
-    // chunk để tránh payload quá lớn
-    const batches = chunk(items, 200);
-    let pushed = 0;
-
-    for (const batch of batches) {
-      const res = await fetch(url, {
+    try {
+      const resp = await fetch(targetUrl, {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(magentoToken ? { Authorization: `Bearer ${magentoToken}` } : {}),
-        },
-        body: JSON.stringify({
-          status: "success",
-          total: batch.length,
-          items: batch,
-        }),
+        headers,
+        body: JSON.stringify(payload),
       });
 
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`Push failed (${res.status}). ${text || ""}`.trim());
-      }
+      statusCode = resp.status;
+      ok = resp.ok;
 
-      pushed += batch.length;
+      // Magento có thể trả JSON hoặc text
+      respText = await resp.text();
+    } catch (e) {
+      respText = String(e?.message || e);
+      ok = false;
     }
 
-    return { success: true, intent, pushed };
+    // lưu log kết quả (optional)
+    const nowIso = new Date().toISOString();
+    const resultSummary = JSON.stringify({
+      ok,
+      status: statusCode,
+      at: nowIso,
+      // cắt bớt log để tránh DB phình
+      response: respText?.slice(0, 2000) || "",
+    });
+
+    await prisma.$transaction([
+      prisma.appSetting.upsert({
+        where: { key: "last_push_at" },
+        create: { key: "last_push_at", value: nowIso },
+        update: { value: nowIso },
+      }),
+      prisma.appSetting.upsert({
+        where: { key: "last_push_result" },
+        create: { key: "last_push_result", value: resultSummary },
+        update: { value: resultSummary },
+      }),
+    ]);
+
+    return {
+      success: ok,
+      pushed: maps.length,
+      targetUrl,
+      statusCode,
+      responsePreview: respText?.slice(0, 500) || "",
+    };
   }
 
-  throw new Response("Invalid intent", { status: 400 });
+  return { success: false, error: "Invalid intent" };
 };
 
 /**
@@ -174,9 +232,10 @@ export const action = async ({ request }) => {
  * CLIENT
  * ======================
  */
+
 export default function AppSettingsPage() {
+  const { settings, mapCount, lastPushAt, lastPushResult } = useLoaderData();
   const shopify = useAppBridge();
-  const data = useLoaderData();
 
   const saveFetcher = useFetcher();
   const pushFetcher = useFetcher();
@@ -184,119 +243,117 @@ export default function AppSettingsPage() {
   const saving = saveFetcher.state !== "idle";
   const pushing = pushFetcher.state !== "idle";
 
-  const [magentoUrl, setMagentoUrl] = useState(data.magentoUrl || "");
-  const [magentoEndpoint, setMagentoEndpoint] = useState(data.magentoEndpoint || "");
-  const [magentoToken, setMagentoToken] = useState(""); // user nhập mới update
-  const [hasToken, setHasToken] = useState(Boolean(data.hasToken));
+  // form state (auto from settings)
+  const initialForm = useMemo(() => {
+    const f = {};
+    for (const field of FIELDS) {
+      // không auto-fill token (tuỳ bạn). Nếu muốn fill thì đổi logic này.
+      if (field.key === "magento_token") {
+        f[field.key] = "";
+      } else {
+        f[field.key] = settings?.[field.key] ?? "";
+      }
+    }
+    return f;
+  }, [settings]);
 
-  const pushUrlPreview = useMemo(
-    () => joinUrl(magentoUrl, magentoEndpoint),
-    [magentoUrl, magentoEndpoint]
-  );
+  const [form, setForm] = useState(initialForm);
+
+  useEffect(() => {
+    setForm(initialForm);
+  }, [initialForm]);
 
   useEffect(() => {
     if (saveFetcher.state === "idle" && saveFetcher.data?.success) {
-      shopify.toast.show("Saved settings");
-      if (magentoToken.trim()) {
-        setHasToken(true);
-        setMagentoToken("");
-      }
+      shopify.toast.show("Settings saved");
+    } else if (saveFetcher.state === "idle" && saveFetcher.data?.success === false) {
+      shopify.toast.show(saveFetcher.data?.error || "Save failed");
     }
   }, [saveFetcher.state]);
 
   useEffect(() => {
-    if (pushFetcher.state === "idle" && pushFetcher.data?.intent === "push_mapping") {
-      if (pushFetcher.data?.success) {
-        const pushed = Number(pushFetcher.data?.pushed || 0);
-        shopify.toast.show(`Pushed ${pushed} mapping rows to Magento`);
+    if (pushFetcher.state === "idle" && pushFetcher.data) {
+      if (pushFetcher.data.success) {
+        shopify.toast.show(
+          `Pushed ${Number(pushFetcher.data.pushed || 0)} mappings to Magento`
+        );
       } else {
-        shopify.toast.show(pushFetcher.data?.message || "Push failed");
+        shopify.toast.show(pushFetcher.data.error || "Push failed");
       }
     }
   }, [pushFetcher.state]);
 
-  const canPush = magentoUrl.trim().length > 0 && magentoEndpoint.trim().length > 0;
+  const pushInfo = (() => {
+    if (!lastPushAt && !lastPushResult) return null;
+    try {
+      const obj = lastPushResult ? JSON.parse(lastPushResult) : null;
+      return { at: lastPushAt, ...obj };
+    } catch {
+      return { at: lastPushAt, raw: lastPushResult };
+    }
+  })();
 
   return (
     <Page title="App settings">
       <BlockStack gap="400">
+        {/* SETTINGS FORM */}
         <Card>
           <BlockStack gap="300">
             <Text variant="headingSm">Magento connection</Text>
 
-            <TextField
-              label="Magento base URL"
-              value={magentoUrl}
-              onChange={setMagentoUrl}
-              placeholder="https://dev.megagastrostore.de"
-              autoComplete="off"
-              helpText="Ví dụ: https://dev.megagastrostore.de (không cần dấu / cuối)"
-            />
-
-            <TextField
-              label="Push endpoint (Magento)"
-              value={magentoEndpoint}
-              onChange={setMagentoEndpoint}
-              placeholder="/rest/V1/shopify/product-map"
-              autoComplete="off"
-              helpText={`URL preview: ${pushUrlPreview}`}
-            />
-
-            <TextField
-              label="Magento token (optional)"
-              value={magentoToken}
-              onChange={setMagentoToken}
-              placeholder={hasToken ? "Token already saved (enter new to replace)" : "Bearer token..."}
-              autoComplete="off"
-              type="password"
-              helpText="Nếu Magento endpoint không cần auth thì để trống."
-            />
+            {FIELDS.map((f) => (
+              <TextField
+                key={f.key}
+                label={f.label}
+                value={form[f.key] ?? ""}
+                onChange={(v) => setForm((p) => ({ ...p, [f.key]: v }))}
+                placeholder={f.placeholder}
+                helpText={f.helpText}
+                type={f.type}
+                autoComplete="off"
+              />
+            ))}
 
             <InlineStack gap="200" align="end">
               <saveFetcher.Form method="post">
                 <input type="hidden" name="intent" value="save_settings" />
-                <input type="hidden" name="magentoUrl" value={magentoUrl} />
-                <input type="hidden" name="magentoEndpoint" value={magentoEndpoint} />
-                <input type="hidden" name="magentoToken" value={magentoToken} />
-                <Button submit variant="primary" loading={saving} disabled={saving || pushing}>
-                  Save
+                {Object.entries(form).map(([k, v]) => (
+                  <input key={k} type="hidden" name={`s_${k}`} value={String(v ?? "")} />
+                ))}
+                <Button submit variant="primary" loading={saving}>
+                  Save settings
                 </Button>
               </saveFetcher.Form>
             </InlineStack>
 
-            {saveFetcher.data?.success === false && saveFetcher.data?.message && (
-              <Banner tone="critical">{saveFetcher.data.message}</Banner>
+            {saveFetcher.data?.success === false && (
+              <Banner tone="critical">
+                <p>{saveFetcher.data?.error || "Save failed"}</p>
+              </Banner>
             )}
           </BlockStack>
         </Card>
 
+        {/* PUSH MAPPING */}
         <Card>
           <BlockStack gap="300">
-            <Text variant="headingSm">Sync mapping to Magento</Text>
-            <Text tone="subdued">
-              Gửi bảng mapping (magentoProductId ↔ shopifyProductId) từ app sang Magento.
-            </Text>
+            <InlineStack align="space-between" blockAlign="center">
+              <BlockStack gap="100">
+                <Text variant="headingSm">Push ProductMap to Magento</Text>
+                <Text tone="subdued">
+                  Current mappings in DB: <b>{mapCount}</b>
+                </Text>
+              </BlockStack>
 
-            {!canPush && (
-              <Banner tone="warning">
-                Bạn cần nhập Magento URL + endpoint trước khi Push.
-              </Banner>
-            )}
-
-            <Divider />
-
-            <InlineStack gap="200" align="end">
               <pushFetcher.Form method="post">
-                <input type="hidden" name="intent" value="push_mapping" />
+                <input type="hidden" name="intent" value="push_product_map" />
                 <Button
                   submit
-                  tone="critical"
                   loading={pushing}
-                  disabled={!canPush || saving || pushing}
                   onClick={(e) => {
                     if (
                       !window.confirm(
-                        "Push mapping toàn bộ sản phẩm sang Magento? (sẽ gửi theo batch)"
+                        "Push toàn bộ mapping (Magento ID ↔ Shopify ID) sang Magento. Continue?"
                       )
                     ) {
                       e.preventDefault();
@@ -307,6 +364,47 @@ export default function AppSettingsPage() {
                 </Button>
               </pushFetcher.Form>
             </InlineStack>
+
+            {pushInfo?.at && (
+              <Banner tone={pushInfo?.ok ? "success" : "warning"}>
+                <p>
+                  Last push: <b>{pushInfo.at}</b>
+                  {typeof pushInfo.status !== "undefined" ? (
+                    <>
+                      {" "}
+                      — status: <b>{pushInfo.status}</b>
+                    </>
+                  ) : null}
+                </p>
+                {pushInfo?.response ? (
+                  <p style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>
+                    {String(pushInfo.response).slice(0, 500)}
+                  </p>
+                ) : null}
+              </Banner>
+            )}
+
+            {pushFetcher.data?.success === false && (
+              <Banner tone="critical">
+                <p>{pushFetcher.data?.error || "Push failed"}</p>
+                {pushFetcher.data?.responsePreview ? (
+                  <p style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>
+                    {pushFetcher.data.responsePreview}
+                  </p>
+                ) : null}
+              </Banner>
+            )}
+
+            {pushFetcher.data?.success && (
+              <Banner tone="success">
+                <p>
+                  Pushed <b>{Number(pushFetcher.data.pushed || 0)}</b> mappings to:
+                </p>
+                <p style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>
+                  {pushFetcher.data.targetUrl}
+                </p>
+              </Banner>
+            )}
           </BlockStack>
         </Card>
       </BlockStack>

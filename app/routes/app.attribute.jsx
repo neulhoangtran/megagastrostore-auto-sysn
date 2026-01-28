@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import { getSettingOr } from "../utils/settings";
 import {
   Page,
   Card,
@@ -24,7 +25,7 @@ import {
 
 const NAMESPACE = "magento";
 const MAGENTO_ATTR_API =
-  "http://dev.megagastrostore.de/rest/V1/shopify/product_attr";
+  "/rest/V1/shopify/product_attr";
 
 function mapMagentoInputToShopifyType(frontendInput, attributeCode) {
   // ưu tiên theo code
@@ -516,8 +517,8 @@ async function syncMetaobjectOptions(admin, { handle, options }) {
 /**
  * Fetch the full Magento attribute (so we can get values/options)
  */
-async function fetchMagentoAttributeByCode(code) {
-  const res = await fetch(MAGENTO_ATTR_API);
+async function fetchMagentoAttributeByCode(magentoUrl,code) {
+  const res = await fetch(magentoUrl + MAGENTO_ATTR_API);
   if (!res.ok) {
     throw new Error("Failed to fetch Magento attributes for options");
   }
@@ -624,6 +625,20 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
+  let MAGENTO_BASE = null;
+  const intentsNeedMagento = new Set(["fetch", "sync", "resync"]);
+  if (intentsNeedMagento.has(intent)) {
+    MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+
+    if (!MAGENTO_BASE) {
+      return {
+        success: false,
+        error: "PLEASE_SETUP_MAGENTO_URL",
+        message: "Please setup url",
+      };
+    }
+  }
+
   if (intent === "clear_magento_global") {
     const deletedMetafieldDefinitions = await deleteAllMagentoMetafieldDefinitions(admin);
     const { deletedDefinitions: deletedMetaobjectDefinitions } =
@@ -639,7 +654,7 @@ export const action = async ({ request }) => {
    * FETCH MAGENTO ATTRIBUTES
    */
   if (intent === "fetch") {
-    const res = await fetch(MAGENTO_ATTR_API);
+    const res = await fetch(MAGENTO_BASE + MAGENTO_ATTR_API);
     if (!res.ok) {
       throw new Response("Failed to fetch Magento attributes", { status: 500 });
     }
@@ -712,7 +727,7 @@ export const action = async ({ request }) => {
 
       metaobjectTypeId = ensuredMetaobjectId || existingMap?.metaobjectTypeId || null;
 
-      const attr = await fetchMagentoAttributeByCode(code);
+      const attr = await fetchMagentoAttributeByCode(MAGENTO_BASE , code);
       const options = Array.isArray(attr?.values) ? attr.values : [];
 
       const result = await syncMetaobjectOptions(admin, {
