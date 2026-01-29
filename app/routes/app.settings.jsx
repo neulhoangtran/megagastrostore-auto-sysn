@@ -126,12 +126,12 @@ export const action = async ({ request }) => {
   if (intent === "push_product_map") {
     // load settings from DB
     const rows = await prisma.appSetting.findMany({
-      where: { key: { in: ["magento_url", "magento_push_endpoint", "magento_token"] } },
+      where: { key: { in: ["magento_url"] } },
     });
     const settings = Object.fromEntries(rows.map((r) => [r.key, r.value]));
 
     const magentoUrl = settings.magento_url || "";
-    const endpoint = "/V1/shopify/get-list-shopify-product-id";
+    const endpoint = "/rest/V1/shopify/get-list-shopify-product-id";
     const token = settings.magento_token || "";
 
     const targetUrl = joinUrl(magentoUrl, endpoint);
@@ -146,9 +146,7 @@ export const action = async ({ request }) => {
     const maps = await prisma.productMapMagento.findMany({
       select: {
         magentoProductId: true,
-        shopifyProductId: true,
-        sku: true,
-        name: true,
+        shopifyProductId: true
       },
       orderBy: { magentoProductId: "asc" },
     });
@@ -159,9 +157,7 @@ export const action = async ({ request }) => {
       total: maps.length,
       items: maps.map((m) => ({
         magento_product_id: m.magentoProductId,
-        shopify_product_id: m.shopifyProductId,
-        sku: m.sku || null,
-        name: m.name || null,
+        shopify_product_id: m.shopifyProductId
       })),
     };
 
