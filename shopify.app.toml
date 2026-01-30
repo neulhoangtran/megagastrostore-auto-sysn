@@ -2,7 +2,7 @@
 
 client_id = "99b5fb810e44540ba762edeeb5152bc4"
 name = "megagastrostore_auto_sysn"
-application_url = "https://shopify.megagastrostore.de"
+application_url = "https://megagastrostore-auto-sysn.vercel.app"
 embedded = true
 
 [build]
@@ -25,5 +25,5 @@ scopes = "read_locations,read_metaobjects,read_products,read_publications,write_
 
 [auth]
 redirect_urls = [
-  "https://shopify.megagastrostore.de/auth/callback"
+  "https://megagastrostore-auto-sysn.vercel.app/auth/callback"
 ]
