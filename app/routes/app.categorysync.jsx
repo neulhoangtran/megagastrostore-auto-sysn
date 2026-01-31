@@ -481,6 +481,10 @@ export default function CategorySyncPage() {
   const [isBulkSyncing, setIsBulkSyncing] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
 
+  const [isBulkProductSyncing, setIsBulkProductSyncing] = useState(false);
+  const [productProgress, setProductProgress] = useState({ done: 0, total: 0 });
+
+
   const items = fetcher.data?.items ?? [];
   const unsyncedItems = items.filter((i) => !i.isSynced).slice(0, 10);
   const allSynced = unsyncedItems.length === 0;
@@ -493,6 +497,34 @@ export default function CategorySyncPage() {
     const t = setTimeout(handleFetch, 200);
     return () => clearTimeout(t);
   }, []);
+
+  const syncAllProducts = async () => {
+    const syncedCategories = items.filter(
+      (i) => i.isSynced && i.shopifyCollectionId
+    );
+
+    if (syncedCategories.length === 0) return;
+
+    setIsBulkProductSyncing(true);
+    setProductProgress({ done: 0, total: syncedCategories.length });
+
+    for (const item of syncedCategories) {
+      const fd = new FormData();
+      fd.append("intent", "sync_products");
+      fd.append("magentoCategoryId", item.magentoCategoryId);
+      fd.append("collectionId", item.shopifyCollectionId);
+
+      await fetch(window.location.pathname, {
+        method: "POST",
+        body: fd,
+      });
+
+      setProductProgress((p) => ({ ...p, done: p.done + 1 }));
+    }
+
+    setIsBulkProductSyncing(false);
+    shopify.toast.show("All products synced");
+  };
 
   const syncAll = async () => {
     if (unsyncedItems.length === 0) return;
@@ -549,7 +581,14 @@ export default function CategorySyncPage() {
               </Button>
             </InlineStack>
           </InlineStack>
-
+          <Button
+            variant="secondary"
+            onClick={syncAllProducts}
+            loading={isBulkProductSyncing}
+            disabled={items.length === 0 || isBulkSyncing}
+          >
+            Sync all products
+          </Button>
           {isBulkSyncing && (
             <BlockStack gap="200">
               <Text>
@@ -558,6 +597,20 @@ export default function CategorySyncPage() {
               <ProgressBar progress={(progress.done / progress.total) * 100} />
             </BlockStack>
           )}
+
+          {isBulkProductSyncing && (
+            <BlockStack gap="200">
+              <Text>
+                Syncing products {productProgress.done} / {productProgress.total}
+              </Text>
+              <ProgressBar
+                progress={
+                  (productProgress.done / productProgress.total) * 100
+                }
+              />
+            </BlockStack>
+          )}
+
         </Card>
 
         {items.length > 0 && (
