@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigation } from "react-router";
+import { useAppBridge } from "@shopify/app-bridge-react";
+import { Button } from "@shopify/polaris";
+import { getSettingOr } from "../utils/settings";
 import {
   useLoaderData,
   useFetcher,
   useNavigate,
   useSearchParams,
 } from "react-router";
-import { useAppBridge } from "@shopify/app-bridge-react";
+
 import {
   Page,
   Card,
@@ -16,7 +20,6 @@ import {
   ResourceList,
   ResourceItem,
   Badge,
-  Button,
 } from "@shopify/polaris";
 import {
   FolderIcon,
@@ -24,6 +27,7 @@ import {
   ChevronRightIcon,
   DragHandleIcon,
 } from "@shopify/polaris-icons";
+
 import {
   DndContext,
   closestCenter,
@@ -42,36 +46,49 @@ import { CSS } from "@dnd-kit/utilities";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { getSettingOr } from "../utils/settings";
 
-/* ============================ CONFIG ============================ */
+/* ===================================================================== */
+/* ============================ CONFIG ================================== */
+/* ===================================================================== */
 
-const INDENT_WIDTH = 24;
+const INDENT_WIDTH = 24; // kéo sang phải mỗi 24px = +1 level
 
-/* ============================ HELPERS ============================ */
+/* ===================================================================== */
+/* ============================ HELPERS ================================= */
+/* ===================================================================== */
 
 function buildTreeFromMagentoCategories(categories, magentoToShopifyMap) {
   const nodesByMagentoId = new Map();
 
+  // Step 1: create node
   categories.forEach((cat) => {
-    const collectionId = magentoToShopifyMap.get(Number(cat.category_id));
-    if (!collectionId) return;
+    const shopifyCollectionId = magentoToShopifyMap.get(
+      Number(cat.category_id)
+    );
+
+    if (!shopifyCollectionId) return; // skip chưa map
 
     nodesByMagentoId.set(Number(cat.category_id), {
-      id: collectionId,
+      id: shopifyCollectionId,
       label: cat.name,
       parentMagentoId: Number(cat.parent_id),
       children: [],
     });
   });
 
+  // Step 2: attach parent-child
   const roots = [];
 
   nodesByMagentoId.forEach((node) => {
     const parent = nodesByMagentoId.get(node.parentMagentoId);
-    parent ? parent.children.push(node) : roots.push(node);
+    if (parent) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
   });
 
+  // Step 3: clean output
   const clean = (n) => ({
     id: n.id,
     label: n.label,
@@ -81,32 +98,39 @@ function buildTreeFromMagentoCategories(categories, magentoToShopifyMap) {
   return roots.map(clean);
 }
 
+
 function getExpandableIds(nodes, set = new Set()) {
   (nodes || []).forEach((n) => {
-    if (n.children?.length) {
-      set.add(n.id);
-      getExpandableIds(n.children, set);
-    }
+    if (n.children?.length) set.add(n.id);
+    if (n.children?.length) getExpandableIds(n.children, set);
   });
   return set;
 }
 
 function buildVersionName(prefix = "version") {
-  const d = new Date();
-  return `${prefix}-${d.getFullYear()}${String(d.getMonth() + 1).padStart(
-    2,
-    "0"
-  )}${String(d.getDate()).padStart(2, "0")}-${String(
-    d.getHours()
-  ).padStart(2, "0")}${String(d.getMinutes()).padStart(
-    2,
-    "0"
-  )}${String(d.getSeconds()).padStart(2, "0")}`;
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mi = String(now.getMinutes()).padStart(2, "0");
+  const ss = String(now.getSeconds()).padStart(2, "0");
+  return `${prefix}-${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
 }
 
+/**
+ * Flatten nested tree -> array with depth/parentId
+ * Node: {id,label,children?}
+ */
 function flattenTree(nodes, parentId = null, depth = 0, result = []) {
   (nodes || []).forEach((node, index) => {
-    result.push({ id: node.id, label: node.label, parentId, depth, position: index });
+    result.push({
+      id: node.id,
+      label: node.label,
+      parentId,
+      depth,
+      position: index,
+    });
     if (node.children?.length) {
       flattenTree(node.children, node.id, depth + 1, result);
     }
@@ -114,29 +138,47 @@ function flattenTree(nodes, parentId = null, depth = 0, result = []) {
   return result;
 }
 
+/**
+ * Build nested tree from flat array (ordered, with parentId+depth)
+ */
 function buildTreeFromFlat(flat) {
   const nodesById = new Map();
   const roots = [];
 
-  flat.forEach((i) => {
-    nodesById.set(i.id, { id: i.id, label: i.label, children: [] });
+  // create nodes
+  flat.forEach((item) => {
+    nodesById.set(item.id, { id: item.id, label: item.label, children: [] });
   });
 
-  flat.forEach((i) => {
-    const node = nodesById.get(i.id);
-    if (!i.parentId) roots.push(node);
-    else nodesById.get(i.parentId)?.children.push(node);
+  // attach
+  flat.forEach((item) => {
+    const node = nodesById.get(item.id);
+    if (!item.parentId) {
+      roots.push(node);
+    } else {
+      const parent = nodesById.get(item.parentId);
+      if (parent) parent.children.push(node);
+      else roots.push(node); // fallback
+    }
   });
 
+  // cleanup empty children
   const cleanup = (n) => {
-    if (!n.children.length) delete n.children;
-    else n.children.forEach(cleanup);
+    if (!n.children?.length) {
+      delete n.children;
+      return;
+    }
+    n.children.forEach(cleanup);
   };
   roots.forEach(cleanup);
 
   return roots;
 }
 
+/**
+ * Get descendants of an item in flat list (based on depth)
+ * So when dragging parent, we can move its subtree as a block
+ */
 function getDescendantCount(flat, index) {
   const depth = flat[index].depth;
   let count = 0;
@@ -147,64 +189,94 @@ function getDescendantCount(flat, index) {
   return count;
 }
 
-function arrayMoveBlock(array, from, to, size) {
-  const arr = [...array];
-  const block = arr.splice(from, size);
-  arr.splice(to, 0, ...block);
-  return arr;
+/**
+ * Move a block (item + its descendants) to a new index
+ */
+function arrayMoveBlock(array, fromIndex, toIndex, blockSize) {
+  const newArray = [...array];
+  const block = newArray.splice(fromIndex, blockSize);
+  newArray.splice(toIndex, 0, ...block);
+  return newArray;
 }
 
+/**
+ * Find the parentId if an item ends up with a given depth at a given index
+ */
 function findParentIdForDepth(flat, index, depth) {
   if (depth === 0) return null;
+
+  // scan upward to find nearest item with depth = depth-1
   for (let i = index - 1; i >= 0; i--) {
     if (flat[i].depth === depth - 1) return flat[i].id;
   }
   return null;
 }
 
+/**
+ * Clamp between min/max
+ */
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+/**
+ * Merge saved menu JSON with Shopify live collections
+ * - deleted -> remove
+ * - new -> append to end (root)
+ * - label always from Shopify
+ */
 function mergeMenuWithShopify(menu, collections) {
-  const map = new Map(collections.map((c) => [c.id, c]));
+  const map = new Map((collections || []).map((c) => [c.id, c]));
 
   const clean = (nodes = []) =>
     nodes
-      .filter((n) => map.has(n.id))
+      .filter((n) => n?.id && map.has(n.id))
       .map((n) => ({
         id: n.id,
         label: map.get(n.id).title,
         children: n.children ? clean(n.children) : undefined,
       }));
 
-  const existing = new Set();
-  const collect = (nodes) => {
-    nodes.forEach((n) => {
-      existing.add(n.id);
-      n.children && collect(n.children);
+  const collectIds = (nodes, set = new Set()) => {
+    (nodes || []).forEach((n) => {
+      set.add(n.id);
+      if (n.children) collectIds(n.children, set);
     });
+    return set;
   };
 
-  const result = clean(menu || []);
-  collect(result);
+  let result = clean(menu || []);
+  const existingIds = collectIds(result);
 
-  const appended = collections
-    .filter((c) => !existing.has(c.id))
+  const appended = (collections || [])
+    .filter((c) => !existingIds.has(c.id))
     .map((c) => ({ id: c.id, label: c.title }));
 
   return [...result, ...appended];
 }
 
+/**
+ * Your old “print order” format (includes parentId)
+ */
 function flattenForSave(nodes, parentId = null, level = 0, result = []) {
   (nodes || []).forEach((node, index) => {
-    result.push({ id: node.id, label: node.label, parentId, position: index, level });
-    node.children && flattenForSave(node.children, node.id, level + 1, result);
+    result.push({
+      id: node.id,
+      label: node.label,
+      parentId,
+      position: index,
+      level,
+    });
+    if (node.children?.length) {
+      flattenForSave(node.children, node.id, level + 1, result);
+    }
   });
   return result;
 }
 
-/* ============================ SERVER ============================ */
+/* ===================================================================== */
+/* ============================ SERVER ================================== */
+/* ===================================================================== */
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -213,7 +285,8 @@ export const loader = async ({ request }) => {
   const url = new URL(request.url);
   const versionId = url.searchParams.get("versionId");
 
-  const res = await admin.graphql(`
+  // 1) Fetch Shopify collections
+  const response = await admin.graphql(`
     query {
       collections(first: 250) {
         nodes { id title }
@@ -221,29 +294,42 @@ export const loader = async ({ request }) => {
     }
   `);
 
-  const json = await res.json();
-  const collections = json.data.collections.nodes;
+  const json = await response.json();
+  const collections =
+    json?.data?.collections?.nodes?.map((c) => ({ id: c.id, title: c.title })) ??
+    [];
 
+  // 2) Read versions
   const versions = await prisma.collectionMenuVersion.findMany({
     where: { shop },
     orderBy: { createdAt: "desc" },
   });
 
-  const selected =
-    (versionId && versions.find((v) => String(v.id) === versionId)) ||
+  // 3) Pick selected version
+  let selected =
+    (versionId
+      ? versions.find((v) => String(v.id) === String(versionId))
+      : null) ||
     versions.find((v) => v.isActive) ||
     versions[0] ||
     null;
 
+  // 4) Base menu (from version or from Shopify list)
   const baseMenu = selected?.menuJson
     ? selected.menuJson
     : collections.map((c) => ({ id: c.id, label: c.title }));
 
+  // 5) Merge
   const tree = mergeMenuWithShopify(baseMenu, collections);
 
   return {
     tree,
-    versions,
+    versions: versions.map((v) => ({
+      id: v.id,
+      versionName: v.versionName,
+      createdAt: v.createdAt,
+      isActive: v.isActive,
+    })),
     selectedVersion: selected
       ? { id: selected.id, versionName: selected.versionName }
       : null,
@@ -253,33 +339,70 @@ export const loader = async ({ request }) => {
 export const action = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-  const fd = await request.formData();
-  const intent = fd.get("intent");
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+  const intentsNeedMagento = new Set(["fetch", "sync", "resync", "sync_products", "build_from_magento"]);
+    let MAGENTO_BASE = null;
+  
+    if (intentsNeedMagento.has(intent)) {
+      MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+  
+      if (!MAGENTO_BASE) {
+        return {
+          success: false,
+          error: "PLEASE_SETUP_MAGENTO_URL",
+          message: "Please setup url",
+        };
+      }
+    }
 
   if (intent === "build_from_magento") {
     const MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
-    if (!MAGENTO_BASE) throw new Response("Missing Magento URL", { status: 400 });
+    if (!MAGENTO_BASE) {
+      throw new Response("Missing Magento URL", { status: 400 });
+    }
 
+    // 1) Fetch Magento categories
     const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/categories`);
-    const data = await res.json();
+    if (!res.ok) {
+      throw new Response("Failed to fetch Magento categories", { status: 500 });
+    }
 
-    const maps = await prisma.productMapMagento.findMany({
-      where: { shopifyCollectionId: { not: null } },
-      select: { magentoCategoryId: true, shopifyCollectionId: true },
+    const data = await res.json();
+    const categories = data.items ?? [];
+
+    // 2) Load mapping Magento → Shopify collection
+    const mappings = await prisma.collectionMapCategory.findMany({
+      select: {
+        magentoCategoryId: true,
+        collectionId: true,
+      },
     });
 
-    const map = new Map(
-      maps.map((m) => [Number(m.magentoCategoryId), m.shopifyCollectionId])
+    const magentoToShopifyMap = new Map(
+      mappings.map((m) => [
+        Number(m.magentoCategoryId),
+        m.collectionId,
+      ])
     );
 
-    return {
-      tree: buildTreeFromMagentoCategories(data.items ?? [], map),
-    };
+
+    // 3) Build tree (UI only)
+    const tree = buildTreeFromMagentoCategories(
+      categories,
+      magentoToShopifyMap
+    );
+
+    return { tree };
   }
 
   if (intent !== "save") return {};
 
-  const tree = JSON.parse(fd.get("treeJson") || "[]");
+  const tree = JSON.parse(formData.get("treeJson") || "[]");
+
+  // Requirement: print current order WITH parentId
+  // console.log("SAVE CATEGORY ORDER:", flattenForSave(tree));
 
   await prisma.$transaction(async (tx) => {
     await tx.collectionMenuVersion.updateMany({
@@ -300,115 +423,168 @@ export const action = async ({ request }) => {
   return { ok: true };
 };
 
-/* ============================ TREE UI ============================ */
+/* ===================================================================== */
+/* ============================ TREE UI ================================= */
+/* ===================================================================== */
 
-function SortableRow({ item, isExpanded, onToggle, style }) {
+function SortableRow({
+  item,
+  isExpanded,
+  onToggle,
+  style,
+}) {
   const { setNodeRef, attributes, listeners, transform, transition } =
     useSortable({ id: item.id });
 
+  const rowStyle = {
+    ...style,
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  const hasChildren = item.hasChildren;
+
   return (
-    <div
-      ref={setNodeRef}
-      style={{
-        ...style,
-        transform: CSS.Transform.toString(transform),
-        transition,
-      }}
-    >
+    <div ref={setNodeRef} style={rowStyle}>
       <div style={{ height: 32, display: "flex", alignItems: "center", gap: 8 }}>
-        {item.hasChildren ? (
-          <span onClick={onToggle}>
+        {hasChildren ? (
+          <span onClick={onToggle} style={{ cursor: "pointer" }}>
             <Icon source={isExpanded ? ChevronDownIcon : ChevronRightIcon} />
           </span>
         ) : (
           <span style={{ width: 20 }} />
         )}
 
-        <span {...attributes} {...listeners}>
+        <span {...attributes} {...listeners} style={{ cursor: "grab" }}>
           <Icon source={DragHandleIcon} />
         </span>
 
-        <Icon source={FolderIcon} />
-        <Text>{item.label}</Text>
+        <span style={{ display: "flex" }}>
+          <Icon source={FolderIcon} />
+        </span>
+
+        <Text as="span">{item.label}</Text>
       </div>
     </div>
   );
 }
 
-function flattenForRender(nodes, expanded, parentId = null, depth = 0, out = []) {
-  nodes.forEach((n) => {
-    const hasChildren = !!n.children?.length;
+/**
+ * Flatten tree for rendering with expanded/collapsed
+ */
+function flattenForRender(nodes, expandedSet, parentId = null, depth = 0, out = []) {
+  (nodes || []).forEach((node) => {
+    const children = node.children || [];
+    const hasChildren = children.length > 0;
     out.push({
-      id: n.id,
-      label: n.label,
+      id: node.id,
+      label: node.label,
       parentId,
       depth,
       hasChildren,
-      isExpanded: expanded.has(n.id),
+      isExpanded: expandedSet.has(node.id),
     });
-    if (hasChildren && expanded.has(n.id)) {
-      flattenForRender(n.children, expanded, n.id, depth + 1, out);
+
+    if (hasChildren && expandedSet.has(node.id)) {
+      flattenForRender(children, expandedSet, node.id, depth + 1, out);
     }
   });
   return out;
 }
 
-/* ============================ PAGE ============================ */
+/* ===================================================================== */
+/* ============================ PAGE ==================================== */
+/* ===================================================================== */
 
 export default function CategoryPage() {
-  const { tree: initialTree, versions, selectedVersion } = useLoaderData();
+  const loaderData = useLoaderData();
   const fetcher = useFetcher();
-  const buildFetcher = useFetcher();
+  const magentoFetcher = useFetcher(); 
   const shopify = useAppBridge();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const didInitExpand = useRef(false);
+  const { tree: initialTree, versions, selectedVersion } = loaderData;
 
+  // Tree state (nested)
   const [tree, setTree] = useState(initialTree ?? []);
-  const [expanded, setExpanded] = useState(new Set());
+
+  // Expand/collapse state
+  const [expanded, setExpanded] = useState(() => new Set());
+
+  // Versions UI
   const [versionsOpen, setVersionsOpen] = useState(false);
+
+  // Drag state
   const [activeId, setActiveId] = useState(null);
   const dragOffsetXRef = useRef(0);
 
   useEffect(() => {
     setTree(initialTree ?? []);
+
     if (!didInitExpand.current) {
-      setExpanded(new Set(getExpandableIds(initialTree)));
+      setExpanded(new Set(getExpandableIds(initialTree ?? [])));
       didInitExpand.current = true;
     }
   }, [initialTree]);
 
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 4 },
+    })
+  );
+
+  const isSaving =
+    fetcher.state === "submitting" &&
+    fetcher.formData?.get("intent") === "save";
+
   useEffect(() => {
     if (fetcher.data?.ok) {
       shopify.toast.show("Category menu saved");
+      // reload to show new active version name if needed
       window.location.reload();
     }
-  }, [fetcher.data]);
+  }, [fetcher.data?.ok, shopify]);
 
   useEffect(() => {
-    if (buildFetcher.data?.tree) {
-      setTree(buildFetcher.data.tree);
-      setExpanded(new Set(getExpandableIds(buildFetcher.data.tree)));
+    if (
+      magentoFetcher.state === "idle" &&
+      magentoFetcher.data?.tree
+    ) {
+      setTree(magentoFetcher.data.tree); // chỉ set UI
+      setExpanded(new Set(getExpandableIds(magentoFetcher.data.tree)));
       shopify.toast.show("Magento structure applied");
     }
-  }, [buildFetcher.data]);
+  }, [magentoFetcher.state, magentoFetcher.data]);
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } })
-  );
-
-  const renderList = useMemo(
-    () => flattenForRender(tree, expanded),
-    [tree, expanded]
-  );
-
-  const visibleIds = useMemo(() => renderList.map((i) => i.id), [renderList]);
-
-  const onSave = () =>
+  const onSave = () => {
+    
     fetcher.submit(
-      { intent: "save", treeJson: JSON.stringify(tree) },
+      {
+        intent: "save",
+        treeJson: JSON.stringify(tree),
+      },
       { method: "POST" }
     );
+  };
+
+  const expandAll = () => {
+    const ids = getExpandableIds(tree);
+    setExpanded(new Set(ids));
+  };
+
+  const collapseAll = () => {
+    setExpanded(new Set());
+  };
+
+  const toggleExpand = (id) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const onPickVersion = (id) => {
     const sp = new URLSearchParams(searchParams);
@@ -417,33 +593,117 @@ export default function CategoryPage() {
     setVersionsOpen(false);
   };
 
-  const computeProjectedDepth = (d) =>
-    d + Math.round(dragOffsetXRef.current / INDENT_WIDTH);
+  // Render list (flat, respects expand/collapse)
+  const renderList = useMemo(() => {
+    return flattenForRender(tree, expanded);
+  }, [tree, expanded]);
 
-  const onDragEnd = ({ active, over }) => {
+  const visibleIds = useMemo(() => renderList.map((x) => x.id), [renderList]);
+
+  // Drag projection: compute new depth based on horizontal drag offset
+  const computeProjectedDepth = (currentDepth) => {
+    const deltaDepth = Math.round(dragOffsetXRef.current / INDENT_WIDTH);
+    return currentDepth + deltaDepth;
+  };
+
+  // Helpers to rebuild nested tree from a "flat list with depth/parentId"
+  const buildFlatWithParentsFromRender = (flatRender) => {
+    // flatRender already has depth & parentId for visible nodes only.
+    // But collapsed nodes are hidden; to allow correct nesting for hidden subtree,
+    // we will operate on FULL flat from the nested tree (not only renderList).
+    // So for DnD we actually flatten FULL tree (not respecting collapse),
+    // then we can preserve hidden subtree.
+    const fullFlat = flattenTree(tree); // includes ALL descendants always
+    return fullFlat;
+  };
+
+  const onDragStart = (event) => {
+    setActiveId(event.active?.id ?? null);
+    dragOffsetXRef.current = 0;
+  };
+
+  const onDragMove = (event) => {
+    // accumulate x delta for depth projection
+    dragOffsetXRef.current = event.delta?.x ?? 0;
+  };
+
+  const onDragEnd = (event) => {
+    const { active, over } = event;
     setActiveId(null);
     if (!over || active.id === over.id) return;
 
-    const flat = flattenTree(tree);
-    const from = flat.findIndex((i) => i.id === active.id);
-    const to = flat.findIndex((i) => i.id === over.id);
-    const size = 1 + getDescendantCount(flat, from);
-    let moved = arrayMoveBlock(flat, from, to, size);
+    // Work on FULL flat tree (includes collapsed children too)
+    const fullFlat = flattenTree(tree);
 
-    const idx = moved.findIndex((i) => i.id === active.id);
-    const prev = moved[idx - 1];
-    const depth = clamp(
-      computeProjectedDepth(moved[idx].depth),
-      0,
-      prev ? prev.depth + 1 : 0
-    );
+    const fromIndex = fullFlat.findIndex((x) => x.id === active.id);
+    const overIndex = fullFlat.findIndex((x) => x.id === over.id);
+    if (fromIndex < 0 || overIndex < 0) return;
 
-    moved[idx].depth = depth;
-    for (let i = 0; i < moved.length; i++) {
-      moved[i].parentId = findParentIdForDepth(moved, i, moved[i].depth);
+    // Move as a block (include descendants)
+    const blockSize = 1 + getDescendantCount(fullFlat, fromIndex);
+
+    // When moving down past itself, target index needs adjustment
+    const toIndex =
+      overIndex > fromIndex ? overIndex - (blockSize - 1) : overIndex;
+
+    let moved = arrayMoveBlock(fullFlat, fromIndex, toIndex, blockSize);
+
+    // Now compute projected depth for the root of the moved block
+    const movedIndex = moved.findIndex((x) => x.id === active.id);
+    const currentDepth = moved[movedIndex].depth;
+
+    // Max depth cannot exceed previous item's depth + 1
+    const prev = moved[movedIndex - 1];
+    const maxDepth = prev ? prev.depth + 1 : 0;
+
+    // Min depth is 0
+    const minDepth = 0;
+
+    const projected = clamp(computeProjectedDepth(currentDepth), minDepth, maxDepth);
+
+    // Apply new depth to the moved root
+    moved[movedIndex] = {
+      ...moved[movedIndex],
+      depth: projected,
+    };
+
+    // Also adjust depths of its descendants relative to root depth change
+    const depthDelta = projected - currentDepth;
+    for (let i = movedIndex + 1; i < movedIndex + blockSize; i++) {
+      moved[i] = {
+        ...moved[i],
+        depth: clamp(moved[i].depth + depthDelta, 0, 99),
+      };
     }
 
-    setTree(buildTreeFromFlat(moved));
+    // Recompute parentId for moved root based on depth
+    const newParentId = findParentIdForDepth(moved, movedIndex, projected);
+    moved[movedIndex] = { ...moved[movedIndex], parentId: newParentId };
+
+    // Recompute parentId for moved descendants based on depth scanning
+    // This is important to ensure correct tree building
+    for (let i = movedIndex + 1; i < movedIndex + blockSize; i++) {
+      const d = moved[i].depth;
+      moved[i] = {
+        ...moved[i],
+        parentId: findParentIdForDepth(moved, i, d),
+      };
+    }
+
+    // Also recompute parentId for items AFTER moved block whose parent chain may shift
+    // (safe + keeps correctness)
+    for (let i = 0; i < moved.length; i++) {
+      if (i >= movedIndex && i < movedIndex + blockSize) continue;
+      const d = moved[i].depth;
+      moved[i] = {
+        ...moved[i],
+        parentId: findParentIdForDepth(moved, i, d),
+      };
+    }
+
+    // Finally build nested tree from flat
+    const newTree = buildTreeFromFlat(moved);
+    setTree(newTree);
   };
 
   return (
@@ -457,12 +717,13 @@ export default function CategoryPage() {
       primaryAction={{
         content: "Save",
         onAction: onSave,
-        loading:
-          fetcher.state === "submitting" &&
-          fetcher.formData?.get("intent") === "save",
+        loading: isSaving,
       }}
       secondaryActions={[
-        { content: "Versions", onAction: () => setVersionsOpen(true) },
+        {
+          content: "Versions",
+          onAction: () => setVersionsOpen(true),
+        },
         {
           content: "Cancel",
           destructive: true,
@@ -471,75 +732,89 @@ export default function CategoryPage() {
       ]}
     >
       <Card>
-        <InlineStack align="space-between" gap="200" padding="200">
-          <InlineStack gap="100">
-            <Button variant="plain" onClick={() => setExpanded(new Set(getExpandableIds(tree)))}>
-              Expand all
-            </Button>
-            <Button variant="plain" onClick={() => setExpanded(new Set())}>
-              Collapse all
-            </Button>
+        <div style={{ padding: 12 }}>
+          <InlineStack align="space-between">
+            <InlineStack gap="200" align="center">
+              <Text as="span" variant="bodyMd">
+                Drag left/right to change level (nesting). Drag up/down to reorder.
+              </Text>
 
-            {/* build from magento */}
-            <buildFetcher.Form method="post">
-              <input type="hidden" name="intent" value="build_from_magento" />
-              <Button
-                variant="secondary"
-                submit
-                loading={buildFetcher.state !== "idle"}
-              >
-                Build from Magento
-              </Button>
-            </buildFetcher.Form>
+              <InlineStack gap="100">
+                <Button variant="plain" onClick={expandAll}>
+                  Expand all
+                </Button>
+
+                <Button variant="plain" onClick={collapseAll}>
+                  Collapse all
+                </Button>
+
+                <magentoFetcher.Form method="post">
+                  <input type="hidden" name="intent" value="build_from_magento" />
+                  <Button
+                    variant="secondary"
+                    submit
+                    loading={magentoFetcher.state !== "idle"}
+                    disabled={magentoFetcher.state !== "idle"}
+                  >
+                    Build from Magento
+                  </Button>
+                </magentoFetcher.Form>
+              </InlineStack>
+            </InlineStack>
+
+            <Badge tone="info">Indent: {INDENT_WIDTH}px</Badge>
           </InlineStack>
+        </div>
 
-          <Badge tone="info">Indent: {INDENT_WIDTH}px</Badge>
-        </InlineStack>
-
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCenter}
-          onDragStart={(e) => setActiveId(e.active.id)}
-          onDragMove={(e) => (dragOffsetXRef.current = e.delta.x)}
-          onDragEnd={onDragEnd}
-        >
-          <SortableContext items={visibleIds} strategy={verticalListSortingStrategy}>
-            {renderList.map((item) => (
-              <SortableRow
-                key={item.id}
-                item={item}
-                isExpanded={item.isExpanded}
-                onToggle={() =>
-                  setExpanded((s) =>
-                    new Set(s.has(item.id) ? [...s].filter((i) => i !== item.id) : [...s, item.id])
-                  )
-                }
-                style={{
-                  paddingLeft: item.depth * INDENT_WIDTH,
-                  opacity: activeId === item.id ? 0.6 : 1,
-                }}
-              />
-            ))}
-          </SortableContext>
-        </DndContext>
+        <div style={{ padding: 12 }}>
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragStart={onDragStart}
+            onDragMove={onDragMove}
+            onDragEnd={onDragEnd}
+          >
+            <SortableContext items={visibleIds} strategy={verticalListSortingStrategy}>
+              {renderList.map((item) => (
+                <SortableRow
+                  key={item.id}
+                  item={item}
+                  isExpanded={item.isExpanded}
+                  onToggle={() => toggleExpand(item.id)}
+                  style={{
+                    paddingLeft: item.depth * INDENT_WIDTH,
+                    opacity: activeId === item.id ? 0.6 : 1,
+                  }}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
+        </div>
       </Card>
 
-      <Modal open={versionsOpen} onClose={() => setVersionsOpen(false)} title="Menu Versions">
+      <Modal
+        open={versionsOpen}
+        onClose={() => setVersionsOpen(false)}
+        title="Menu Versions"
+      >
         <Modal.Section>
           <ResourceList
-            items={versions}
-            renderItem={(v) => (
-              <ResourceItem id={String(v.id)} onClick={() => onPickVersion(v.id)}>
+            items={versions ?? []}
+            renderItem={(item) => (
+              <ResourceItem
+                id={String(item.id)}
+                onClick={() => onPickVersion(item.id)}
+              >
                 <InlineStack align="space-between">
-                  <InlineStack gap="200">
-                    <Text fontWeight="semibold">{v.versionName}</Text>
-                    {v.isActive && <Badge tone="success">Active</Badge>}
-                    {selectedVersion?.id === v.id && (
+                  <InlineStack gap="200" align="center">
+                    <Text fontWeight="semibold">{item.versionName}</Text>
+                    {item.isActive && <Badge tone="success">Active</Badge>}
+                    {selectedVersion?.id === item.id && (
                       <Badge tone="info">Selected</Badge>
                     )}
                   </InlineStack>
                   <Text tone="subdued">
-                    {new Date(v.createdAt).toLocaleString()}
+                    {new Date(item.createdAt).toLocaleString()}
                   </Text>
                 </InlineStack>
               </ResourceItem>
@@ -551,6 +826,10 @@ export default function CategoryPage() {
   );
 }
 
-/* ============================ HEADERS ============================ */
+/* ===================================================================== */
+/* ============================ HEADERS ================================= */
+/* ===================================================================== */
 
-export const headers = (args) => boundary.headers(args);
+export const headers = (headersArgs) => {
+  return boundary.headers(headersArgs);
+};
