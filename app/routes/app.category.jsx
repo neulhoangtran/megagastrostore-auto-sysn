@@ -542,7 +542,7 @@ export default function CategoryPage() {
     if (fetcher.data?.ok) {
       shopify.toast.show("Category menu saved");
       // reload to show new active version name if needed
-      window.location.reload();
+      // window.location.reload();
     }
   }, [fetcher.data?.ok, shopify]);
 
