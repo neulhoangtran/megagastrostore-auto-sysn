@@ -59,7 +59,7 @@ function asString(value, fallback = "") {
 }
 
 // Magento image helpers
-const MAGENTO_BASE_URL = "https://dev.megagastrostore.de";
+const MAGENTO_BASE_URL = "https://www.megagastrostore.de";
 function buildMagentoImageUrl(imagePath) {
   if (!imagePath) return null;
   if (imagePath.startsWith("http")) return imagePath;
@@ -143,7 +143,7 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  const intentsNeedMagento = new Set(["fetch", "sync", "resync"]);
+  const intentsNeedMagento = new Set(["fetch", "sync", "resync", "sync_products"]);
     let MAGENTO_BASE = null;
   
     if (intentsNeedMagento.has(intent)) {
