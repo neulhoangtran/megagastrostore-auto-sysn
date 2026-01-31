@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigation } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { Button } from "@shopify/polaris";
+import { getSettingOr } from "../utils/settings";
 import {
   useLoaderData,
   useFetcher,
@@ -55,6 +56,48 @@ const INDENT_WIDTH = 24; // kéo sang phải mỗi 24px = +1 level
 /* ===================================================================== */
 /* ============================ HELPERS ================================= */
 /* ===================================================================== */
+
+function buildTreeFromMagentoCategories(categories, magentoToShopifyMap) {
+  const nodesByMagentoId = new Map();
+
+  // Step 1: create node
+  categories.forEach((cat) => {
+    const shopifyCollectionId = magentoToShopifyMap.get(
+      Number(cat.category_id)
+    );
+
+    if (!shopifyCollectionId) return; // skip chưa map
+
+    nodesByMagentoId.set(Number(cat.category_id), {
+      id: shopifyCollectionId,
+      label: cat.name,
+      parentMagentoId: Number(cat.parent_id),
+      children: [],
+    });
+  });
+
+  // Step 2: attach parent-child
+  const roots = [];
+
+  nodesByMagentoId.forEach((node) => {
+    const parent = nodesByMagentoId.get(node.parentMagentoId);
+    if (parent) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  });
+
+  // Step 3: clean output
+  const clean = (n) => ({
+    id: n.id,
+    label: n.label,
+    ...(n.children.length ? { children: n.children.map(clean) } : {}),
+  });
+
+  return roots.map(clean);
+}
+
 
 function getExpandableIds(nodes, set = new Set()) {
   (nodes || []).forEach((n) => {
@@ -299,13 +342,69 @@ export const action = async ({ request }) => {
 
   const formData = await request.formData();
   const intent = formData.get("intent");
+  const intentsNeedMagento = new Set(["fetch", "sync", "resync", "sync_products"]);
+    let MAGENTO_BASE = null;
+  
+    if (intentsNeedMagento.has(intent)) {
+      MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+  
+      if (!MAGENTO_BASE) {
+        return {
+          success: false,
+          error: "PLEASE_SETUP_MAGENTO_URL",
+          message: "Please setup url",
+        };
+      }
+    }
+
+  if (intent === "build_from_magento") {
+      const MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+      if (!MAGENTO_BASE) {
+        throw new Response("Missing Magento URL", { status: 400 });
+      }
+
+      // 1) Fetch Magento categories
+      const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/categories`);
+      if (!res.ok) {
+        throw new Response("Failed to fetch Magento categories", { status: 500 });
+      }
+
+      const data = await res.json();
+      const categories = data.items ?? [];
+
+      // 2) Load mapping Magento → Shopify collection
+      const mappings = await prisma.productMapMagento.findMany({
+        where: {
+          shopifyCollectionId: { not: null },
+        },
+        select: {
+          magentoCategoryId: true,
+          shopifyCollectionId: true,
+        },
+      });
+
+      const magentoToShopifyMap = new Map(
+        mappings.map((m) => [
+          Number(m.magentoCategoryId),
+          m.shopifyCollectionId,
+        ])
+      );
+
+      // 3) Build tree (UI only)
+      const tree = buildTreeFromMagentoCategories(
+        categories,
+        magentoToShopifyMap
+      );
+
+      return { tree };
+    }
 
   if (intent !== "save") return {};
 
   const tree = JSON.parse(formData.get("treeJson") || "[]");
 
   // Requirement: print current order WITH parentId
-  console.log("SAVE CATEGORY ORDER:", flattenForSave(tree));
+  // console.log("SAVE CATEGORY ORDER:", flattenForSave(tree));
 
   await prisma.$transaction(async (tx) => {
     await tx.collectionMenuVersion.updateMany({
@@ -458,6 +557,25 @@ export default function CategoryPage() {
       { method: "POST" }
     );
   };
+
+  const applyMagentoTree = async () => {
+    const fd = new FormData();
+    fd.append("intent", "build_from_magento");
+
+    const res = await fetch(window.location.pathname, {
+      method: "POST",
+      body: fd,
+    });
+
+    const json = await res.json();
+
+    if (json?.tree) {
+      setTree(json.tree); // ✅ chỉ set UI
+      setExpanded(new Set(getExpandableIds(json.tree)));
+      shopify.toast.show("Magento structure applied");
+    }
+  };
+
 
   const expandAll = () => {
     const ids = getExpandableIds(tree);
@@ -637,6 +755,10 @@ export default function CategoryPage() {
 
                 <Button variant="plain" onClick={collapseAll}>
                   Collapse all
+                </Button>
+
+                <Button variant="secondary" onClick={applyMagentoTree}>
+                  Build from Magento
                 </Button>
               </InlineStack>
             </InlineStack>
