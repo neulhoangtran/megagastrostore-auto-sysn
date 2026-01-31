@@ -482,7 +482,7 @@ export default function CategorySyncPage() {
   const [progress, setProgress] = useState({ done: 0, total: 0 });
 
   const items = fetcher.data?.items ?? [];
-  const unsyncedItems = items.filter((i) => !i.isSynced).slice(0, 10);
+  const unsyncedItems = items.filter((i) => !i.isSynced);
   const allSynced = unsyncedItems.length === 0;
 
   const handleFetch = () => {
