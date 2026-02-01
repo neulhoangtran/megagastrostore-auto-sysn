@@ -46,16 +46,20 @@ import { CSS } from "@dnd-kit/utilities";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-
-/* ===================================================================== */
-/* ============================ CONFIG ================================== */
-/* ===================================================================== */
-
 const INDENT_WIDTH = 24; // kéo sang phải mỗi 24px = +1 level
 
-/* ===================================================================== */
 /* ============================ HELPERS ================================= */
-/* ===================================================================== */
+function collectDirectChildrenMap(nodes, map = new Map()) {
+  (nodes || []).forEach((node) => {
+    const childrenIds = (node.children || []).map((c) => c.id);
+    map.set(node.id, childrenIds);
+
+    if (node.children?.length) {
+      collectDirectChildrenMap(node.children, map);
+    }
+  });
+  return map;
+}
 
 function buildTreeFromMagentoCategories(categories, magentoToShopifyMap) {
   const nodesByMagentoId = new Map();
@@ -357,6 +361,50 @@ export const action = async ({ request }) => {
       }
     }
 
+  if (intent === "reupdate_sub_collections") {
+    const { admin } = await authenticate.admin(request);
+    const tree = JSON.parse(formData.get("treeJson") || "[]");
+
+    // 1) Build parent -> direct children map
+    const childrenMap = collectDirectChildrenMap(tree);
+    // 2) Prepare metafields
+    const metafields = [];
+
+    childrenMap.forEach((children, collectionId) => {
+      metafields.push({
+        ownerId: collectionId,
+        namespace: "custom",
+        key: "list_of_sub_collections",
+        type: "json",
+        value: JSON.stringify(children),
+      });
+    });
+
+    // 3) Chunk để tránh Shopify limit
+    const CHUNK_SIZE = 25;
+    for (let i = 0; i < metafields.length; i += CHUNK_SIZE) {
+      const chunk = metafields.slice(i, i + CHUNK_SIZE);
+
+      const res = await admin.graphql(
+        `#graphql
+        mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            userErrors { field message }
+          }
+        }`,
+        { variables: { metafields: chunk } }
+      );
+
+      const json = await res.json();
+      const errors = json?.data?.metafieldsSet?.userErrors ?? [];
+      if (errors.length) {
+        throw new Error(errors[0].message);
+      }
+    }
+
+    return { success: true, total: metafields.length };
+  }
+
   if (intent === "build_from_magento") {
     const MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
     if (!MAGENTO_BASE) {
@@ -505,7 +553,7 @@ export default function CategoryPage() {
   const [searchParams] = useSearchParams();
   const didInitExpand = useRef(false);
   const { tree: initialTree, versions, selectedVersion } = loaderData;
-
+  
   // Tree state (nested)
   const [tree, setTree] = useState(initialTree ?? []);
 
@@ -537,6 +585,11 @@ export default function CategoryPage() {
   const isSaving =
     fetcher.state === "submitting" &&
     fetcher.formData?.get("intent") === "save";
+
+  const isUpdatingSubCollections =
+    fetcher.state === "submitting" &&
+    fetcher.formData?.get("intent") === "reupdate_sub_collections";
+
 
   useEffect(() => {
     if (fetcher.data?.ok) {
@@ -616,6 +669,17 @@ export default function CategoryPage() {
     const fullFlat = flattenTree(tree); // includes ALL descendants always
     return fullFlat;
   };
+
+  const reupdateSubCollections = () => {
+    fetcher.submit(
+      {
+        intent: "reupdate_sub_collections",
+        treeJson: JSON.stringify(tree),
+      },
+      { method: "POST" }
+    );
+  };
+
 
   const onDragStart = (event) => {
     setActiveId(event.active?.id ?? null);
@@ -759,6 +823,15 @@ export default function CategoryPage() {
                     Build from Magento
                   </Button>
                 </magentoFetcher.Form>
+
+                <Button
+                  variant="secondary"
+                  loading={isUpdatingSubCollections}
+                  onClick={reupdateSubCollections}
+                >
+                  Re-update sub collection list
+                </Button>
+
               </InlineStack>
             </InlineStack>
 
