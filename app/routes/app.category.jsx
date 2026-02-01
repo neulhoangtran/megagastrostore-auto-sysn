@@ -61,6 +61,18 @@ function collectDirectChildrenMap(nodes, map = new Map()) {
   return map;
 }
 
+function collectAllCollectionIds(childrenMap) {
+  const allIds = new Set();
+
+  childrenMap.forEach((children, parentId) => {
+    allIds.add(parentId);
+    children.forEach((cid) => allIds.add(cid));
+  });
+
+  return Array.from(allIds);
+}
+
+
 function buildTreeFromMagentoCategories(categories, magentoToShopifyMap) {
   const nodesByMagentoId = new Map();
 
@@ -278,6 +290,58 @@ function flattenForSave(nodes, parentId = null, level = 0, result = []) {
   return result;
 }
 
+async function fetchCollectionHandles(admin, ids) {
+  if (!ids.length) return [];
+
+  const res = await admin.graphql(
+    `#graphql
+    query GetCollections($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on Collection {
+          id
+          handle
+        }
+      }
+    }`,
+    { variables: { ids } }
+  );
+
+  const json = await res.json();
+
+  return (json?.data?.nodes || []).filter(Boolean);
+}
+
+
+function buildHandleMap(collections) {
+  const map = new Map();
+  collections.forEach((c) => {
+    map.set(c.id, c.handle);
+  });
+  return map;
+}
+
+function buildSubCollectionHandleMap(childrenMap, handleMap) {
+  const result = new Map();
+
+  childrenMap.forEach((children, parentId) => {
+    const handles = children
+      .map((cid) => handleMap.get(cid))
+      .filter(Boolean);
+
+    result.set(parentId, handles);
+  });
+
+  return result;
+}
+
+function chunkArray(arr, size = 25) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
+
 /* ===================================================================== */
 /* ============================ SERVER ================================== */
 /* ===================================================================== */
@@ -293,7 +357,7 @@ export const loader = async ({ request }) => {
   const response = await admin.graphql(`
     query {
       collections(first: 250) {
-        nodes { id title }
+        nodes { id title handle }
       }
     }
   `);
@@ -365,22 +429,47 @@ export const action = async ({ request }) => {
     const { admin } = await authenticate.admin(request);
     const tree = JSON.parse(formData.get("treeJson") || "[]");
 
-    // 1) Build parent -> direct children map
+    // 1) parent -> direct children (collectionId)
     const childrenMap = collectDirectChildrenMap(tree);
-    // 2) Prepare metafields
+
+    // 2) collect ALL collectionIds (parent + children)
+    const allCollectionIds = new Set();
+    childrenMap.forEach((children, parentId) => {
+      allCollectionIds.add(parentId);
+      children.forEach((cid) => allCollectionIds.add(cid));
+    });
+
+    const allIds = Array.from(allCollectionIds);
+
+    // 3) fetch handles from Shopify
+    const collections = await fetchCollectionHandles(admin, allIds);
+
+    // 4) build collectionId -> handle map
+    const handleMap = new Map();
+    collections.forEach((c) => {
+      if (c?.id && c?.handle) {
+        handleMap.set(c.id, c.handle);
+      }
+    });
+
+    // 5) build metafields payload (handle[])
     const metafields = [];
 
-    childrenMap.forEach((children, collectionId) => {
+    childrenMap.forEach((children, parentId) => {
+      const handles = children
+        .map((cid) => handleMap.get(cid))
+        .filter(Boolean); // tránh null
+
       metafields.push({
-        ownerId: collectionId,
+        ownerId: parentId,
         namespace: "custom",
         key: "list_of_sub_collections",
         type: "json",
-        value: JSON.stringify(children),
+        value: JSON.stringify(handles), // ✅ ["sub-1","sub-2"]
       });
     });
 
-    // 3) Chunk để tránh Shopify limit
+    // 6) chunk để tránh Shopify limit
     const CHUNK_SIZE = 25;
     for (let i = 0; i < metafields.length; i += CHUNK_SIZE) {
       const chunk = metafields.slice(i, i + CHUNK_SIZE);
