@@ -16,6 +16,60 @@ import {
   Badge,
 } from "@shopify/polaris";
 
+
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return "";
+  const str = String(value);
+  if (str.includes('"') || str.includes(",") || str.includes("\n")) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function buildReviewCsv(items = []) {
+  const header = [
+    "title",
+    "body",
+    "rating",
+    "review_date",
+    "reviewer_name",
+    "reviewer_email",
+    "product_id",
+    "product_handle",
+    "reply",
+    "picture_urls",
+  ];
+
+  const rows = items.map((item) => [
+    csvEscape(item.title),
+    csvEscape(item.detail),
+    item.rating || "",
+    item.created_at ? `${item.created_at} UTC` : "",
+    csvEscape(item.nickname),
+    "", // reviewer_email
+    "", // product_id
+    csvEscape(item.sku), // product_handle (tạm)
+    "", // reply
+    "", // picture_urls
+  ]);
+
+  return [header.join(","), ...rows.map((r) => r.join(","))].join("\n");
+}
+
+function downloadCsv(content, filename) {
+  const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+
+  URL.revokeObjectURL(url);
+}
+
+
 /**
  * ======================
  * SERVER
@@ -128,18 +182,34 @@ export default function ReviewPage() {
     <Page title="Product Reviews">
       <BlockStack gap="400">
         <Card>
-          <InlineStack align="space-between">
-            <Text variant="headingSm">
-              Magento → Product Reviews
-            </Text>
+            <InlineStack align="space-between">
+                <Text variant="headingSm">
+                    Magento → Product Reviews
+                </Text>
 
-            <Button
-              onClick={handleFetch}
-              loading={fetcher.state !== "idle"}
-            >
-              Fetch reviews
-            </Button>
-          </InlineStack>
+                <InlineStack gap="200">
+                    <Button
+                    onClick={handleFetch}
+                    loading={fetcher.state !== "idle"}
+                    >
+                    Fetch reviews
+                    </Button>
+
+                    <Button
+                    variant="primary"
+                    disabled={!items.length}
+                    onClick={() => {
+                        const csv = buildReviewCsv(items);
+                        downloadCsv(
+                        csv,
+                        `magento-reviews-${new Date().toISOString().slice(0, 10)}.csv`
+                        );
+                    }}
+                    >
+                    Export CSV
+                    </Button>
+                </InlineStack>
+            </InlineStack>
         </Card>
 
         {items.length > 0 && (
