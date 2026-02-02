@@ -15,6 +15,7 @@ import {
   Scrollable,
   Badge,
 } from "@shopify/polaris";
+
 /**
  * ======================
  * SERVER
@@ -46,20 +47,14 @@ export const action = async ({ request }) => {
 
   /**
    * ======================
-   * FETCH REVIEWS (UI)
+   * FETCH REVIEWS (JSON)
    * ======================
    */
   if (intent === "fetch") {
-    const lastReviewId = formData.get("lastReviewId") || "";
     const pageSize = formData.get("pageSize") || 50;
 
-    const qs = new URLSearchParams();
-    if (lastReviewId) qs.set("lastReviewId", lastReviewId);
-    qs.set("pageSize", pageSize);
-
     const res = await fetch(
-    //   `${MAGENTO_BASE}/rest/V1/shopify/product-reviews?${qs.toString()}`
-    'http://dev.megagastrostore.de/rest/V1/shopify/product-reviews'
+      `http://dev.megagastrostore.de/rest/V1/shopify/product-reviews`
     );
 
     if (!res.ok) {
@@ -68,7 +63,6 @@ export const action = async ({ request }) => {
 
     const data = await res.json();
 
-    // Magento response: [total, items]
     const total = Array.isArray(data) ? Number(data[0] || 0) : 0;
     const items = Array.isArray(data) ? data[1] || [] : [];
 
@@ -81,7 +75,7 @@ export const action = async ({ request }) => {
 
   /**
    * ======================
-   * EXPORT CSV
+   * EXPORT CSV (FILE)
    * ======================
    */
   if (intent === "export_csv") {
@@ -100,7 +94,7 @@ export const action = async ({ request }) => {
       throw new Response("No reviews to export", { status: 404 });
     }
 
-    // 🔗 Map Magento product_id -> Shopify product_id
+    // 🔗 Map Magento product_id → Shopify product_id
     const magentoProductIds = [
       ...new Set(items.map((i) => i.product_id).filter(Boolean)),
     ];
@@ -119,7 +113,6 @@ export const action = async ({ request }) => {
       mappings.map((m) => [m.magentoProductId, m.shopifyProductId])
     );
 
-    // CSV helpers
     const csvEscape = (value) => {
       if (value === null || value === undefined) return "";
       const str = String(value);
@@ -152,11 +145,11 @@ export const action = async ({ request }) => {
         item.rating || "",
         item.created_at ? `${item.created_at} UTC` : "",
         csvEscape(item.nickname),
-        "", // reviewer_email
-        shopifyProductId, // ✅ Shopify product_id
-        "", // ⛔ product_handle (tạm trống)
-        "", // reply
-        "", // picture_urls
+        "",
+        shopifyProductId,
+        "",
+        "",
+        "",
       ].join(",");
     });
 
@@ -191,7 +184,8 @@ function RatingBadge({ value }) {
 }
 
 export default function ReviewPage() {
-  const fetcher = useFetcher();
+  const fetcher = useFetcher();        // ✅ JSON fetch
+  const exportFetcher = useFetcher(); // ✅ CSV export
   const shopify = useAppBridge();
 
   const [pageSize] = useState(50);
@@ -200,10 +194,7 @@ export default function ReviewPage() {
 
   const handleFetch = () => {
     fetcher.submit(
-      {
-        intent: "fetch",
-        pageSize,
-      },
+      { intent: "fetch", pageSize },
       { method: "POST" }
     );
   };
@@ -225,33 +216,32 @@ export default function ReviewPage() {
     <Page title="Product Reviews">
       <BlockStack gap="400">
         <Card>
-            <InlineStack align="space-between">
-                <Text variant="headingSm">
-                    Magento → Product Reviews
-                </Text>
+          <InlineStack align="space-between">
+            <Text variant="headingSm">
+              Magento → Product Reviews
+            </Text>
 
-                <InlineStack gap="200">
-                    <Button
-                    onClick={handleFetch}
-                    loading={fetcher.state !== "idle"}
-                    >
-                    Fetch reviews
-                    </Button>
+            <InlineStack gap="200">
+              <Button
+                onClick={handleFetch}
+                loading={fetcher.state !== "idle"}
+              >
+                Fetch reviews
+              </Button>
 
-                    <Button
-                        variant="primary"
-                        onClick={() => {
-                            fetcher.submit(
-                            { intent: "export_csv" },
-                            { method: "POST" }
-                            );
-                        }}
-                        >
-                        Export CSV
-                    </Button>
-
-                </InlineStack>
+              <exportFetcher.Form method="post">
+                <input type="hidden" name="intent" value="export_csv" />
+                <Button
+                  variant="primary"
+                  submit
+                  loading={exportFetcher.state !== "idle"}
+                  disabled={!items.length}
+                >
+                  Export CSV
+                </Button>
+              </exportFetcher.Form>
             </InlineStack>
+          </InlineStack>
         </Card>
 
         {items.length > 0 && (
@@ -277,15 +267,9 @@ export default function ReviewPage() {
                     key={item.review_id}
                     position={index}
                   >
-                    <IndexTable.Cell>
-                      {item.review_id}
-                    </IndexTable.Cell>
-                    <IndexTable.Cell>
-                      {item.sku}
-                    </IndexTable.Cell>
-                    <IndexTable.Cell>
-                      {item.nickname}
-                    </IndexTable.Cell>
+                    <IndexTable.Cell>{item.review_id}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.sku}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.nickname}</IndexTable.Cell>
                     <IndexTable.Cell>
                       <RatingBadge value={item.rating} />
                     </IndexTable.Cell>
