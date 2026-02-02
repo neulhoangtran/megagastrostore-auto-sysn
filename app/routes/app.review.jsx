@@ -2,7 +2,6 @@ import { useFetcher } from "react-router";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
-import { getSettingOr } from "../utils/settings";
 import prisma from "../db.server";
 import {
   Page,
@@ -15,6 +14,14 @@ import {
   Scrollable,
   Badge,
 } from "@shopify/polaris";
+
+/**
+ * ======================
+ * CONSTANT
+ * ======================
+ */
+const MAGENTO_API =
+  "http://dev.megagastrostore.de/rest/V1/shopify/product-reviews";
 
 /**
  * ======================
@@ -33,29 +40,13 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  const MAGENTO_BASE = String(
-    await getSettingOr("magento_url", "")
-  ).trim();
-
-  if (!MAGENTO_BASE) {
-    return {
-      success: false,
-      error: "PLEASE_SETUP_MAGENTO_URL",
-      message: "Please setup Magento URL",
-    };
-  }
-
   /**
    * ======================
    * FETCH REVIEWS (JSON)
    * ======================
    */
   if (intent === "fetch") {
-    const pageSize = formData.get("pageSize") || 50;
-
-    const res = await fetch(
-      `http://dev.megagastrostore.de/rest/V1/shopify/product-reviews`
-    );
+    const res = await fetch(MAGENTO_API);
 
     if (!res.ok) {
       throw new Response("Failed to fetch reviews", { status: 500 });
@@ -63,6 +54,7 @@ export const action = async ({ request }) => {
 
     const data = await res.json();
 
+    // Magento response: [total, items]
     const total = Array.isArray(data) ? Number(data[0] || 0) : 0;
     const items = Array.isArray(data) ? data[1] || [] : [];
 
@@ -75,13 +67,11 @@ export const action = async ({ request }) => {
 
   /**
    * ======================
-   * EXPORT CSV (FILE)
+   * EXPORT CSV (DOWNLOAD)
    * ======================
    */
   if (intent === "export_csv") {
-    const res = await fetch(
-      `http://dev.megagastrostore.de/rest/V1/shopify/product-reviews`
-    );
+    const res = await fetch(MAGENTO_API);
 
     if (!res.ok) {
       throw new Response("Failed to fetch reviews", { status: 500 });
@@ -94,7 +84,7 @@ export const action = async ({ request }) => {
       throw new Response("No reviews to export", { status: 404 });
     }
 
-    // 🔗 Map Magento product_id → Shopify product_id
+    // Map Magento product_id -> Shopify product_id
     const magentoProductIds = [
       ...new Set(items.map((i) => i.product_id).filter(Boolean)),
     ];
@@ -184,17 +174,14 @@ function RatingBadge({ value }) {
 }
 
 export default function ReviewPage() {
-  const fetcher = useFetcher();        // ✅ JSON fetch
-  const exportFetcher = useFetcher(); // ✅ CSV export
+  const fetcher = useFetcher(); // ✅ chỉ dùng cho fetch JSON
   const shopify = useAppBridge();
-
-  const [pageSize] = useState(50);
 
   const items = fetcher.data?.items ?? [];
 
   const handleFetch = () => {
     fetcher.submit(
-      { intent: "fetch", pageSize },
+      { intent: "fetch" },
       { method: "POST" }
     );
   };
@@ -203,14 +190,6 @@ export default function ReviewPage() {
     const t = setTimeout(handleFetch, 200);
     return () => clearTimeout(t);
   }, []);
-
-  useEffect(() => {
-    if (fetcher.data?.error === "PLEASE_SETUP_MAGENTO_URL") {
-      shopify.toast.show("Please setup Magento URL first", {
-        isError: true,
-      });
-    }
-  }, [fetcher.data]);
 
   return (
     <Page title="Product Reviews">
@@ -229,17 +208,17 @@ export default function ReviewPage() {
                 Fetch reviews
               </Button>
 
-              <exportFetcher.Form method="post">
+              {/* ✅ FORM THƯỜNG – BẮT BUỘC ĐỂ DOWNLOAD */}
+              <form method="post">
                 <input type="hidden" name="intent" value="export_csv" />
                 <Button
                   variant="primary"
                   submit
-                  loading={exportFetcher.state !== "idle"}
                   disabled={!items.length}
                 >
                   Export CSV
                 </Button>
-              </exportFetcher.Form>
+              </form>
             </InlineStack>
           </InlineStack>
         </Card>
