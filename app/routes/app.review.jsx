@@ -86,7 +86,7 @@ export const action = async ({ request }) => {
    */
   if (intent === "export_csv") {
     const res = await fetch(
-      `${MAGENTO_BASE}/rest/V1/shopify/product-reviews?pageSize=1000`
+      `http://dev.megagastrostore.de/rest/V1/shopify/product-reviews`
     );
 
     if (!res.ok) {
