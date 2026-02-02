@@ -15,61 +15,6 @@ import {
   Scrollable,
   Badge,
 } from "@shopify/polaris";
-
-
-
-function csvEscape(value) {
-  if (value === null || value === undefined) return "";
-  const str = String(value);
-  if (str.includes('"') || str.includes(",") || str.includes("\n")) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
-
-function buildReviewCsv(items = []) {
-  const header = [
-    "title",
-    "body",
-    "rating",
-    "review_date",
-    "reviewer_name",
-    "reviewer_email",
-    "product_id",
-    "product_handle",
-    "reply",
-    "picture_urls",
-  ];
-
-  const rows = items.map((item) => [
-    csvEscape(item.title),
-    csvEscape(item.detail),
-    item.rating || "",
-    item.created_at ? `${item.created_at} UTC` : "",
-    csvEscape(item.nickname),
-    "", // reviewer_email
-    "", // product_id
-    csvEscape(item.sku), // product_handle (tạm)
-    "", // reply
-    "", // picture_urls
-  ]);
-
-  return [header.join(","), ...rows.map((r) => r.join(","))].join("\n");
-}
-
-function downloadCsv(content, filename) {
-  const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-
-  URL.revokeObjectURL(url);
-}
-
-
 /**
  * ======================
  * SERVER
@@ -87,10 +32,6 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  if (intent !== "fetch") {
-    throw new Response("Invalid intent", { status: 400 });
-  }
-
   const MAGENTO_BASE = String(
     await getSettingOr("magento_url", "")
   ).trim();
@@ -103,33 +44,135 @@ export const action = async ({ request }) => {
     };
   }
 
-  const lastReviewId = formData.get("lastReviewId") || "";
-  const pageSize = formData.get("pageSize") || 50;
+  /**
+   * ======================
+   * FETCH REVIEWS (UI)
+   * ======================
+   */
+  if (intent === "fetch") {
+    const lastReviewId = formData.get("lastReviewId") || "";
+    const pageSize = formData.get("pageSize") || 50;
 
-  const qs = new URLSearchParams();
-  if (lastReviewId) qs.set("lastReviewId", lastReviewId);
-  qs.set("pageSize", pageSize);
+    const qs = new URLSearchParams();
+    if (lastReviewId) qs.set("lastReviewId", lastReviewId);
+    qs.set("pageSize", pageSize);
 
-  const res = await fetch(
-    // `${MAGENTO_BASE}/rest/V1/mega/shopify/product-reviews?${qs.toString()}`
-    `http://dev.megagastrostore.de/rest/V1/shopify/product-reviews?${qs.toString()}`
-  );
+    const res = await fetch(
+    //   `${MAGENTO_BASE}/rest/V1/shopify/product-reviews?${qs.toString()}`
+    'http://dev.megagastrostore.de/rest/V1/shopify/product-reviews'
+    );
 
-  if (!res.ok) {
-    throw new Response("Failed to fetch reviews", { status: 500 });
-  }
+    if (!res.ok) {
+      throw new Response("Failed to fetch reviews", { status: 500 });
+    }
 
-  const data = await res.json();
+    const data = await res.json();
 
-    // data = [total, items]
+    // Magento response: [total, items]
     const total = Array.isArray(data) ? Number(data[0] || 0) : 0;
     const items = Array.isArray(data) ? data[1] || [] : [];
 
     return {
-    success: true,
-    total,
-    items,
+      success: true,
+      total,
+      items,
     };
+  }
+
+  /**
+   * ======================
+   * EXPORT CSV
+   * ======================
+   */
+  if (intent === "export_csv") {
+    const res = await fetch(
+      `${MAGENTO_BASE}/rest/V1/shopify/product-reviews?pageSize=1000`
+    );
+
+    if (!res.ok) {
+      throw new Response("Failed to fetch reviews", { status: 500 });
+    }
+
+    const data = await res.json();
+    const items = Array.isArray(data) ? data[1] || [] : [];
+
+    if (!items.length) {
+      throw new Response("No reviews to export", { status: 404 });
+    }
+
+    // 🔗 Map Magento product_id -> Shopify product_id
+    const magentoProductIds = [
+      ...new Set(items.map((i) => i.product_id).filter(Boolean)),
+    ];
+
+    const mappings = await prisma.productMapMagento.findMany({
+      where: {
+        magentoProductId: { in: magentoProductIds },
+      },
+      select: {
+        magentoProductId: true,
+        shopifyProductId: true,
+      },
+    });
+
+    const productIdMap = new Map(
+      mappings.map((m) => [m.magentoProductId, m.shopifyProductId])
+    );
+
+    // CSV helpers
+    const csvEscape = (value) => {
+      if (value === null || value === undefined) return "";
+      const str = String(value);
+      if (str.includes('"') || str.includes(",") || str.includes("\n")) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const header = [
+      "title",
+      "body",
+      "rating",
+      "review_date",
+      "reviewer_name",
+      "reviewer_email",
+      "product_id",
+      "product_handle",
+      "reply",
+      "picture_urls",
+    ].join(",");
+
+    const rows = items.map((item) => {
+      const shopifyProductId =
+        productIdMap.get(item.product_id) || "";
+
+      return [
+        csvEscape(item.title),
+        csvEscape(item.detail),
+        item.rating || "",
+        item.created_at ? `${item.created_at} UTC` : "",
+        csvEscape(item.nickname),
+        "", // reviewer_email
+        shopifyProductId, // ✅ Shopify product_id
+        "", // ⛔ product_handle (tạm trống)
+        "", // reply
+        "", // picture_urls
+      ].join(",");
+    });
+
+    const csv = [header, ...rows].join("\n");
+
+    return new Response(csv, {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="magento-reviews-${new Date()
+          .toISOString()
+          .slice(0, 10)}.csv"`,
+      },
+    });
+  }
+
+  throw new Response("Invalid intent", { status: 400 });
 };
 
 /**
@@ -196,18 +239,17 @@ export default function ReviewPage() {
                     </Button>
 
                     <Button
-                    variant="primary"
-                    disabled={!items.length}
-                    onClick={() => {
-                        const csv = buildReviewCsv(items);
-                        downloadCsv(
-                        csv,
-                        `magento-reviews-${new Date().toISOString().slice(0, 10)}.csv`
-                        );
-                    }}
-                    >
-                    Export CSV
+                        variant="primary"
+                        onClick={() => {
+                            fetcher.submit(
+                            { intent: "export_csv" },
+                            { method: "POST" }
+                            );
+                        }}
+                        >
+                        Export CSV
                     </Button>
+
                 </InlineStack>
             </InlineStack>
         </Card>
