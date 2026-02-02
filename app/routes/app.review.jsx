@@ -67,11 +67,15 @@ export const action = async ({ request }) => {
 
   const data = await res.json();
 
-  return {
+    // data = [total, items]
+    const total = Array.isArray(data) ? Number(data[0] || 0) : 0;
+    const items = Array.isArray(data) ? data[1] || [] : [];
+
+    return {
     success: true,
-    items: data.items || [],
-    total: data.total || 0,
-  };
+    total,
+    items,
+    };
 };
 
 /**
