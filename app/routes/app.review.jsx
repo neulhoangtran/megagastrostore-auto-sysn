@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { getSettingOr } from "../utils/settings";
-
+import prisma from "../db.server";
 import {
   Page,
   Card,
