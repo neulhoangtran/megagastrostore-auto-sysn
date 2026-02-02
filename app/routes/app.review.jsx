@@ -57,7 +57,8 @@ export const action = async ({ request }) => {
   qs.set("pageSize", pageSize);
 
   const res = await fetch(
-    `${MAGENTO_BASE}/rest/V1/mega/shopify/product-reviews?${qs.toString()}`
+    // `${MAGENTO_BASE}/rest/V1/mega/shopify/product-reviews?${qs.toString()}`
+    `http://dev.megagastrostore.de/rest/V1/mega/shopify/product-reviews?${qs.toString()}`
   );
 
   if (!res.ok) {
