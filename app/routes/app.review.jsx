@@ -62,11 +62,18 @@ export const loader = async ({ request }) => {
     mappings.map((m) => [m.magentoProductId, m.shopifyProductId])
   );
 
-  // 3️⃣ Map data
-  const items = reviews.map((r) => ({
-    ...r,
-    shopify_product_id: productIdMap.get(r.product_id) || "",
-  }));
+  const items = reviews.map((r) => {
+    const gid = productIdMap.get(r.product_id) || "";
+
+    const shopifyProductId = gid.startsWith("gid://shopify/Product/")
+        ? gid.replace("gid://shopify/Product/", "")
+        : gid;
+
+        return {
+            ...r,
+            shopify_product_id: shopifyProductId,
+        };
+    });
 
   return {
     total,
