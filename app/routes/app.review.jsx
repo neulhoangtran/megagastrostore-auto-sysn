@@ -1,7 +1,5 @@
-import { useFetcher } from "react-router";
-import { useEffect, useState } from "react";
+import { useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
-import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
 import {
   Page,
@@ -25,137 +23,55 @@ const MAGENTO_API =
 
 /**
  * ======================
- * SERVER
+ * SERVER (LOAD ALL DATA)
  * ======================
  */
-
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
-  return null;
-};
 
-export const action = async ({ request }) => {
-  await authenticate.admin(request);
-
-  const formData = await request.formData();
-  const intent = formData.get("intent");
-
-  /**
-   * ======================
-   * FETCH REVIEWS (JSON)
-   * ======================
-   */
-  if (intent === "fetch") {
-    const res = await fetch(MAGENTO_API);
-
-    if (!res.ok) {
-      throw new Response("Failed to fetch reviews", { status: 500 });
-    }
-
-    const data = await res.json();
-
-    // Magento response: [total, items]
-    const total = Array.isArray(data) ? Number(data[0] || 0) : 0;
-    const items = Array.isArray(data) ? data[1] || [] : [];
-
-    return {
-      success: true,
-      total,
-      items,
-    };
+  // 1️⃣ Fetch Magento reviews
+  const res = await fetch(MAGENTO_API);
+  if (!res.ok) {
+    throw new Response("Failed to fetch reviews", { status: 500 });
   }
 
-  /**
-   * ======================
-   * EXPORT CSV (DOWNLOAD)
-   * ======================
-   */
-  if (intent === "export_csv") {
-    const res = await fetch(MAGENTO_API);
+  const data = await res.json();
+  const total = Array.isArray(data) ? Number(data[0] || 0) : 0;
+  const reviews = Array.isArray(data) ? data[1] || [] : [];
 
-    if (!res.ok) {
-      throw new Response("Failed to fetch reviews", { status: 500 });
-    }
-
-    const data = await res.json();
-    const items = Array.isArray(data) ? data[1] || [] : [];
-
-    if (!items.length) {
-      throw new Response("No reviews to export", { status: 404 });
-    }
-
-    // Map Magento product_id -> Shopify product_id
-    const magentoProductIds = [
-      ...new Set(items.map((i) => i.product_id).filter(Boolean)),
-    ];
-
-    const mappings = await prisma.productMapMagento.findMany({
-      where: {
-        magentoProductId: { in: magentoProductIds },
-      },
-      select: {
-        magentoProductId: true,
-        shopifyProductId: true,
-      },
-    });
-
-    const productIdMap = new Map(
-      mappings.map((m) => [m.magentoProductId, m.shopifyProductId])
-    );
-
-    const csvEscape = (value) => {
-      if (value === null || value === undefined) return "";
-      const str = String(value);
-      if (str.includes('"') || str.includes(",") || str.includes("\n")) {
-        return `"${str.replace(/"/g, '""')}"`;
-      }
-      return str;
-    };
-
-    const header = [
-      "title",
-      "body",
-      "rating",
-      "review_date",
-      "reviewer_name",
-      "reviewer_email",
-      "product_id",
-      "product_handle",
-      "reply",
-      "picture_urls",
-    ].join(",");
-
-    const rows = items.map((item) => {
-      const shopifyProductId =
-        productIdMap.get(item.product_id) || "";
-
-      return [
-        csvEscape(item.title),
-        csvEscape(item.detail),
-        item.rating || "",
-        item.created_at ? `${item.created_at} UTC` : "",
-        csvEscape(item.nickname),
-        "",
-        shopifyProductId,
-        "",
-        "",
-        "",
-      ].join(",");
-    });
-
-    const csv = [header, ...rows].join("\n");
-
-    return new Response(csv, {
-      headers: {
-        "Content-Type": "text/csv; charset=utf-8",
-        "Content-Disposition": `attachment; filename="magento-reviews-${new Date()
-          .toISOString()
-          .slice(0, 10)}.csv"`,
-      },
-    });
+  if (!reviews.length) {
+    return { total: 0, items: [] };
   }
 
-  throw new Response("Invalid intent", { status: 400 });
+  // 2️⃣ Fetch DB mapping
+  const magentoProductIds = [
+    ...new Set(reviews.map((r) => r.product_id).filter(Boolean)),
+  ];
+
+  const mappings = await prisma.productMapMagento.findMany({
+    where: {
+      magentoProductId: { in: magentoProductIds },
+    },
+    select: {
+      magentoProductId: true,
+      shopifyProductId: true,
+    },
+  });
+
+  const productIdMap = new Map(
+    mappings.map((m) => [m.magentoProductId, m.shopifyProductId])
+  );
+
+  // 3️⃣ Map data
+  const items = reviews.map((r) => ({
+    ...r,
+    shopify_product_id: productIdMap.get(r.product_id) || "",
+  }));
+
+  return {
+    total,
+    items,
+  };
 };
 
 /**
@@ -166,30 +82,68 @@ export const action = async ({ request }) => {
 
 function RatingBadge({ value }) {
   if (!value) return <Badge tone="subdued">No rating</Badge>;
-
   const tone =
     value >= 4 ? "success" : value >= 3 ? "attention" : "critical";
-
   return <Badge tone={tone}>{value} ★</Badge>;
 }
 
+// CSV helpers (CLIENT SIDE)
+function csvEscape(value) {
+  if (value === null || value === undefined) return "";
+  const str = String(value);
+  if (str.includes('"') || str.includes(",") || str.includes("\n")) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function exportReviewsToCsv(items) {
+  const header = [
+    "title",
+    "body",
+    "rating",
+    "review_date",
+    "reviewer_name",
+    "reviewer_email",
+    "product_id",
+    "product_handle",
+    "reply",
+    "picture_urls",
+  ];
+
+  const rows = items.map((item) => [
+    csvEscape(item.title),
+    csvEscape(item.detail),
+    item.rating || "",
+    item.created_at ? `${item.created_at} UTC` : "",
+    csvEscape(item.nickname),
+    "",
+    item.shopify_product_id,
+    "",
+    "",
+    "",
+  ]);
+
+  const csv =
+    [header.join(","), ...rows.map((r) => r.join(","))].join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `magento-reviews-${new Date()
+    .toISOString()
+    .slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+
+  URL.revokeObjectURL(url);
+}
+
 export default function ReviewPage() {
-  const fetcher = useFetcher(); // ✅ chỉ dùng cho fetch JSON
-  const shopify = useAppBridge();
-
-  const items = fetcher.data?.items ?? [];
-
-  const handleFetch = () => {
-    fetcher.submit(
-      { intent: "fetch" },
-      { method: "POST" }
-    );
-  };
-
-  useEffect(() => {
-    const t = setTimeout(handleFetch, 200);
-    return () => clearTimeout(t);
-  }, []);
+  const { items, total } = useLoaderData();
 
   return (
     <Page title="Product Reviews">
@@ -197,33 +151,20 @@ export default function ReviewPage() {
         <Card>
           <InlineStack align="space-between">
             <Text variant="headingSm">
-              Magento → Product Reviews
+              Magento → Product Reviews ({total})
             </Text>
 
-            <InlineStack gap="200">
-              <Button
-                onClick={handleFetch}
-                loading={fetcher.state !== "idle"}
-              >
-                Fetch reviews
-              </Button>
-
-              {/* ✅ FORM THƯỜNG – BẮT BUỘC ĐỂ DOWNLOAD */}
-              <form method="post">
-                <input type="hidden" name="intent" value="export_csv" />
-                <Button
-                  variant="primary"
-                  submit
-                  disabled={!items.length}
-                >
-                  Export CSV
-                </Button>
-              </form>
-            </InlineStack>
+            <Button
+              variant="primary"
+              disabled={!items.length}
+              onClick={() => exportReviewsToCsv(items)}
+            >
+              Export CSV
+            </Button>
           </InlineStack>
         </Card>
 
-        {items.length > 0 && (
+        {items.length > 0 ? (
           <Card padding="0">
             <Scrollable style={{ height: "650px" }}>
               <IndexTable
@@ -268,9 +209,7 @@ export default function ReviewPage() {
               </IndexTable>
             </Scrollable>
           </Card>
-        )}
-
-        {fetcher.state === "idle" && items.length === 0 && (
+        ) : (
           <Card>
             <Text>No reviews found</Text>
           </Card>
