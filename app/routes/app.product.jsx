@@ -1153,6 +1153,8 @@ export default function ProductPage() {
   // test sync 10
   const unsyncedItems = items.filter((i) => !i.isSynced);//.slice(0, 10);
   const allSynced = unsyncedItems.length === 0;
+  const syncedItems = items.filter((i) => i.isSynced).slice(0, 10);
+  const allResynced = syncedItems.length === 0;
 
   const handleFetch = (nextPage = page, nextProductId = searchId) => {
     if (String(nextProductId || "").trim().length > 0) {
@@ -1186,6 +1188,41 @@ export default function ProductPage() {
     const t = setTimeout(() => handleFetch(1), 200);
     return () => clearTimeout(t);
   }, []);
+
+  const resyncAll = async () => {
+    if (syncedItems.length === 0) return;
+
+    setIsBulkSyncing(true);
+    setProgress({ done: 0, total: syncedItems.length });
+
+    for (const item of syncedItems) {
+      const fd = new FormData();
+      fd.append("intent", "resync"); // 🔥 khác sync
+      fd.append("magentoProductId", item.magentoProductId);
+      fd.append("name", item.name);
+      fd.append("sku", item.sku || "");
+      fd.append("price", item.price || "");
+      fd.append("qty", item.qty ?? 0);
+      fd.append("weight", item.weight ?? 0);
+
+      fd.append("description", item.description || "");
+      fd.append("metaTitle", item.metaTitle || "");
+      fd.append("metaDescription", item.metaDescription || "");
+      fd.append("imageUrl", item.imageUrl || "");
+      fd.append("galleryJson", item.galleryJson || "");
+
+      await fetch(window.location.pathname, {
+        method: "POST",
+        body: fd,
+      });
+
+      setProgress((p) => ({ ...p, done: p.done + 1 }));
+    }
+
+    setIsBulkSyncing(false);
+    handleFetch(page);
+    shopify.toast.show("All products re-synced");
+  };
 
   const syncAll = async () => {
     if (unsyncedItems.length === 0) return;
@@ -1284,6 +1321,15 @@ export default function ProductPage() {
                 disabled={allSynced || isBulkSyncing}
               >
                 Sync all
+              </Button>
+
+              <Button
+                variant="secondary"
+                onClick={resyncAll}
+                loading={isBulkSyncing}
+                disabled={allResynced || isBulkSyncing}
+              > 
+                Re-sync all
               </Button>
             </InlineStack>
           </InlineStack>
