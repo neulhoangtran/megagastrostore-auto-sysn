@@ -330,6 +330,39 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
       continue;
     }
 
+    // ---- single_line_text_field ----
+  if (type === "single_line_text_field") {
+    let v = pickMagentoValue(a);
+
+    // decode HTML entities
+    v = heLib ? heLib.decode(v) : v;
+
+    // remove html
+    v = v
+      .replace(/<br\s*\/?>/gi, " ")
+      .replace(/<\/?[^>]+>/g, "")
+      .replace(/[\r\n]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // Shopify limit
+    if (v.length > 255) {
+      v = v.slice(0, 255);
+    }
+
+    if (!v) continue;
+
+    mfInputs.push({
+      ownerId: shopifyProductId,
+      namespace: ns,
+      key,
+      type,
+      value: v,
+    });
+
+    continue;
+  }
+
     // ---- default text/textarea/number_decimal/... ----
     const v = pickMagentoValue(a);
     if (!v) continue;
