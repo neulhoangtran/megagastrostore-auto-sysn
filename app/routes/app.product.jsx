@@ -1153,7 +1153,7 @@ export default function ProductPage() {
   // test sync 10
   const unsyncedItems = items.filter((i) => !i.isSynced);//.slice(0, 10);
   const allSynced = unsyncedItems.length === 0;
-  const syncedItems = items.filter((i) => i.isSynced).slice(0, 10);
+  const syncedItems = items.filter((i) => i.isSynced);
   const allResynced = syncedItems.length === 0;
 
   const handleFetch = (nextPage = page, nextProductId = searchId) => {
