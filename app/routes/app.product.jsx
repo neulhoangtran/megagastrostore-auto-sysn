@@ -250,8 +250,12 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
       if (!handle) continue;
 
       const realType = resolveMetaobjectTypeFromHandle(defs, handle);
-      console.log([defs, handle, realType]);
-      alert("test");
+      console.log("resolve metaobject", {
+        handle,
+        defs,
+        realType,
+      });
+
       if (!realType) continue;
 
       const optionMap = await getMetaobjectOptionIdMap(admin, {
