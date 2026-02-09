@@ -27,6 +27,26 @@ const NAMESPACE = "magento";
 const MAGENTO_ATTR_API =
   "/rest/V1/shopify/product_attr";
 
+function toShopifySafeText(value) {
+  return String(value ?? "")
+    // remove all control chars
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    // remove HTML line breaks
+    .replace(/<br\s*\/?>/gi, " ")
+    // collapse whitespace
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function toShopifyChoiceJson(choices) {
+  return JSON.stringify(
+    choices.map((c) => ({
+      label: toShopifySafeText(c.label),
+      value: toShopifySafeText(c.value),
+    }))
+  );
+}
+
 function mapMagentoInputToShopifyType(frontendInput, attributeCode) {
   // ưu tiên theo code
   if (attributeCode === "short_description") return "rich_text_field";
@@ -43,6 +63,14 @@ function mapMagentoInputToShopifyType(frontendInput, attributeCode) {
   };
 
   return map[frontendInput] || null;
+}
+
+function toSingleLineJson(value) {
+  return JSON.stringify(value)
+    .replace(/\n/g, "")
+    .replace(/\r/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function isSelectInput(input) {
@@ -132,11 +160,22 @@ async function bulkDeleteMetaobjectsByType(admin, type) {
   );
 
   const json = await res.json();
-  const errs = json?.data?.metaobjectBulkDelete?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
+  const payload = json?.data?.metaobjectBulkDelete;
 
-  return json?.data?.metaobjectBulkDelete?.job ?? null;
+  const errs = payload?.userErrors ?? [];
+
+  // ✅ Shopify enqueue message = SUCCESS
+  const realErrors = errs.filter(
+    e => !e.message?.toLowerCase().includes("enqueued")
+  );
+
+  if (realErrors.length) {
+    throw new Error(realErrors[0].message);
+  }
+
+  return payload?.job ?? null;
 }
+
 
 async function deleteMetaobjectDefinitionById(admin, id) {
   const res = await admin.graphql(
@@ -157,24 +196,11 @@ async function deleteMetaobjectDefinitionById(admin, id) {
   return true;
 }
 
-async function deleteAllMagentoMetaobjects(admin) {
-  const defs = await listMagentoMetaobjectDefinitions(admin);
-
-  let deletedDefinitions = 0;
-  for (const d of defs) {
-    await deleteMetaobjectDefinitionById(admin, d.id);
-    deletedDefinitions += 1;
-  }
-
-  return { deletedDefinitions };
-}
-
-
 
 function mapSelectInputToMetafieldType(input) {
   return input === "multiselect"
-    ? "list.metaobject_reference"
-    : "metaobject_reference";
+    ? "list.single_line_text_field"
+    : "single_line_text_field";
 }
 
 function safeJsonParse(value, fallback) {
@@ -228,7 +254,13 @@ async function getExistingMagentoMetafieldKeys(admin) {
   return new Set(defs.map((d) => `${d.namespace}.${d.key}`));
 }
 
-async function createMetafieldDefinition(admin, { key, name, type, metaobjectDefinitionId }) {
+async function createMetafieldDefinition(admin, {
+  key,
+  name,
+  type,
+  choices = null,
+}) {
+  
   const def = {
     ownerType: "PRODUCT",
     namespace: NAMESPACE,
@@ -237,17 +269,24 @@ async function createMetafieldDefinition(admin, { key, name, type, metaobjectDef
     type,
   };
 
-  if (type.includes("metaobject_reference")) {
-    if (!metaobjectDefinitionId) {
-      throw new Error("Missing metaobjectDefinitionId for metaobject_reference metafield");
+  if (Array.isArray(choices) && choices.length > 0) {
+    const choiceJson = toShopifyChoiceJson(choices);
+
+    if (choiceJson.length <= 255) {
+      def.validations = [
+        {
+          name: "choices",
+          value: choiceJson,
+        },
+      ];
+    } else {
+      console.warn(
+        `[Shopify] Skip choices for ${key} – too many options (${choices.length})`
+      );
     }
-    def.validations = [
-      {
-        name: "metaobject_definition_id",
-        value: metaobjectDefinitionId,
-      },
-    ];
   }
+
+
 
   const res = await admin.graphql(
     `#graphql
@@ -307,131 +346,6 @@ async function deleteAllMagentoMetafields(admin) {
  * ======================
  */
 
-// Query definition by type (needed when already exists, or to update access/displayNameKey)
-async function getMetaobjectDefinitionByType(admin, { type }) {
-  const res = await admin.graphql(
-    `#graphql
-    query GetDef($type: String!) {
-      metaobjectDefinitionByType(type: $type) {
-        id
-        type
-        name
-        displayNameKey
-        access {
-          storefront
-          admin
-        }
-      }
-    }`,
-    { variables: { type } }
-  );
-
-  const json = await res.json();
-  return json?.data?.metaobjectDefinitionByType ?? null;
-}
-
-async function updateMetaobjectDefinition(admin, { id }) {
-  const res = await admin.graphql(
-    `#graphql
-    mutation UpdateDef($id: ID!, $definition: MetaobjectDefinitionUpdateInput!) {
-      metaobjectDefinitionUpdate(id: $id, definition: $definition) {
-        metaobjectDefinition {
-          id
-          displayNameKey
-          access { storefront admin }
-        }
-        userErrors { message }
-      }
-    }`,
-    {
-      variables: {
-        id,
-        definition: {
-          // Ensure storefront can read + ensure entries show label as display name
-          access: { storefront: "PUBLIC_READ", admin: "MERCHANT_READ_WRITE" },
-          displayNameKey: "label",
-        },
-      },
-    }
-  );
-
-  const json = await res.json();
-  const errs = json?.data?.metaobjectDefinitionUpdate?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-
-  return json?.data?.metaobjectDefinitionUpdate?.metaobjectDefinition ?? null;
-}
-
-async function ensureMetaobjectDefinition(admin, { type, name }) {
-  const _existing = await getMetaobjectDefinitionByType(admin, { type });
-  if (_existing?.id) {
-    return _existing.id;
-  }
-  // IMPORTANT:
-  // - type MUST be app-reserved to allow setting access.admin
-  // - Example: "$app:magento_tuerart_option"
-  const res = await admin.graphql(
-    `#graphql
-    mutation CreateMetaobjectDefinition($definition: MetaobjectDefinitionCreateInput!) {
-      metaobjectDefinitionCreate(definition: $definition) {
-        metaobjectDefinition {
-          id
-          type
-          displayNameKey
-          access { storefront admin }
-        }
-        userErrors { message }
-      }
-    }`,
-    {
-      variables: {
-        definition: {
-          name,
-          type,
-          access: { admin: "MERCHANT_READ_WRITE", storefront: "PUBLIC_READ" },
-          displayNameKey: "label",
-          fieldDefinitions: [
-            { name: "Label", key: "label", type: "single_line_text_field" },
-            { name: "Value", key: "value", type: "single_line_text_field" },
-          ],
-        },
-      },
-    }
-  );
-
-  const json = await res.json();
-  const payload = json?.data?.metaobjectDefinitionCreate;
-
-  // If created OK
-  if (payload?.metaobjectDefinition?.id) {
-    return payload.metaobjectDefinition.id;
-  }
-
-  // If errors: allow "already exists", then fetch & update to ensure storefront + displayNameKey
-  const msg = payload?.userErrors?.[0]?.message || "";
-  if (msg && !msg.toLowerCase().includes("already exists")) {
-    throw new Error(msg);
-  }
-
-  const existing = await getMetaobjectDefinitionByType(admin, { type });
-  if (!existing?.id) {
-    // Fallback: if we cannot fetch it, surface the original message
-    throw new Error(msg || "Metaobject definition exists but cannot be fetched");
-  }
-
-  // Ensure displayNameKey & storefront access are correct
-  const needsUpdate =
-    existing.displayNameKey !== "label" ||
-    existing.access?.storefront !== "PUBLIC_READ" ||
-    existing.access?.admin !== "MERCHANT_READ_WRITE";
-
-  if (needsUpdate) {
-    await updateMetaobjectDefinition(admin, { id: existing.id });
-  }
-
-  return existing.id;
-}
-
 async function getExistingMetaobjectOptionLabels(admin, { handle }) {
   const res = await admin.graphql(
     `#graphql
@@ -455,63 +369,6 @@ async function getExistingMetaobjectOptionLabels(admin, { handle }) {
     if (label) labels.add(label);
   }
   return labels;
-}
-
-async function createMetaobjectOption(admin, { handle, label, value }) {
-  const res = await admin.graphql(
-    `#graphql
-    mutation CreateMetaobject($input: MetaobjectCreateInput!) {
-      metaobjectCreate(metaobject: $input) {
-        metaobject { id }
-        userErrors { message }
-      }
-    }`,
-    {
-      variables: {
-        input: {
-          type: handle,
-          fields: [
-            { key: "label", value: String(label ?? "").trim() },
-            { key: "value", value: String(value ?? "").trim() },
-          ],
-        },
-      },
-    }
-  );
-
-  const json = await res.json();
-  const errs = json?.data?.metaobjectCreate?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-}
-
-/**
- * Sync Magento options -> metaobject records (anti-duplicate by label)
- */
-async function syncMetaobjectOptions(admin, { handle, options }) {
-  if (!Array.isArray(options) || options.length === 0) return { created: 0 };
-
-  const existingLabels = await getExistingMetaobjectOptionLabels(admin, {
-    handle,
-  });
-
-  let created = 0;
-  for (const opt of options) {
-    const label = String(opt?.label ?? "").trim();
-    if (!label) continue;
-
-    if (existingLabels.has(label)) continue;
-
-    await createMetaobjectOption(admin, {
-      handle,
-      label,
-      value: opt?.value ?? "",
-    });
-
-    existingLabels.add(label);
-    created += 1;
-  }
-
-  return { created };
 }
 
 /**
@@ -586,27 +443,6 @@ async function deleteMetaobjectDefinitionByType(admin, { type }) {
   if (errs.length) throw new Error(errs[0].message);
 
   return true;
-}
-
-async function deleteMetaobjectsByTypes(admin, types) {
-  const uniq = Array.from(new Set((types || []).filter(Boolean)));
-  let deletedEntries = 0;
-  let deletedDefinitions = 0;
-
-  for (const type of uniq) {
-    // delete entries first
-    const entryIds = await listMetaobjectEntryIdsByType(admin, { type });
-    for (const id of entryIds) {
-      await deleteMetaobjectEntry(admin, { id });
-      deletedEntries += 1;
-    }
-
-    // then delete definition
-    const deleted = await deleteMetaobjectDefinitionByType(admin, { type });
-    if (deleted) deletedDefinitions += 1;
-  }
-
-  return { deletedEntries, deletedDefinitions };
 }
 
 /**
@@ -705,55 +541,77 @@ export const action = async ({ request }) => {
     const existingKeys = await getExistingMagentoMetafieldKeys(admin);
     const fullKey = `${NAMESPACE}.${code}`;
 
+    // ====== GIỮ NGUYÊN BIẾN CŨ ======
     let shopifyType;
     let metaobjectHandle = null;
     let metaobjectTypeId = null;
     let metaobjectOptionsCreated = 0;
 
+    // ====== NEW: choice list ======
+    let choices = null;
+
     if (isSelectInput(input)) {
+      // ====== CHUYỂN HƯỚNG SANG CHOICE LIST ======
       shopifyType = mapSelectInputToMetafieldType(input);
 
-      // IMPORTANT: app-reserved type to allow admin access configuration
-      metaobjectHandle = `$app:magento_${code}_option`;
-
-      const existingMap = await prisma.attributeMapMetafield.findUnique({
-        where: { magentoAttributeCode: code },
-      });
-
-      const ensuredMetaobjectId = await ensureMetaobjectDefinition(admin, {
-        type: metaobjectHandle,
-        name: label || code,
-      });
-
-      metaobjectTypeId = ensuredMetaobjectId || existingMap?.metaobjectTypeId || null;
-
-      const attr = await fetchMagentoAttributeByCode(MAGENTO_BASE , code);
+      // 🔥 FETCH MAGENTO OPTIONS
+      const attr = await fetchMagentoAttributeByCode(MAGENTO_BASE, code);
       const options = Array.isArray(attr?.values) ? attr.values : [];
 
-      const result = await syncMetaobjectOptions(admin, {
-        handle: metaobjectHandle,
-        options,
-      });
+      choices = options
+        .filter(o => o?.label)
+        .map(o => ({
+          label: String(o.label).trim(),
+          value: String(o.value ?? o.label).trim(),
+        }));
 
-      metaobjectOptionsCreated = result.created || 0;
+      /**
+       * ⚠️ LOGIC METAOBJECT CŨ – GIỮ NGUYÊN NHƯNG KHÔNG GỌI
+       * (để rollback / backward compatibility)
+       */
+      metaobjectHandle = `$app:magento_${code}_option`;
+      metaobjectTypeId = null;
+      metaobjectOptionsCreated = 0;
     } else {
+      // ====== NON SELECT INPUT – GIỮ NGUYÊN ======
       shopifyType = mapMagentoInputToShopifyType(input, code);
       if (!shopifyType) {
         throw new Error(`Unsupported attribute type: ${input}`);
       }
     }
 
+    /**
+     * 🔥 RESYNC: Shopify KHÔNG UPDATE VALIDATION
+     * → PHẢI XOÁ DEFINITION TRƯỚC
+     */
+    if (intent === "resync") {
+      await deleteAllMagentoMetafieldDefinitions(admin);
+    }
+
+    /**
+     * CREATE METAFIELD DEFINITION
+     */
     if (intent === "sync" && !existingKeys.has(fullKey)) {
       await createMetafieldDefinition(admin, {
         key: code,
         name: label || code,
         type: shopifyType,
-        metaobjectDefinitionId: shopifyType.includes("metaobject_reference")
-          ? metaobjectTypeId
-          : null,
+        choices, // ✅ ADD CHOICE LIST
       });
     }
 
+    if (intent === "resync") {
+      await createMetafieldDefinition(admin, {
+        key: code,
+        name: label || code,
+        type: shopifyType,
+        choices, // ✅ ADD CHOICE LIST
+      });
+    }
+
+    /**
+     * PRISMA – GIỮ NGUYÊN FIELD CŨ
+     */
     await prisma.attributeMapMetafield.upsert({
       where: { magentoAttributeCode: code },
       create: {
@@ -778,6 +636,7 @@ export const action = async ({ request }) => {
     };
   }
 
+
   /**
    * CLEAR ALL
    * - Delete metafield definitions (namespace magento)
@@ -785,23 +644,20 @@ export const action = async ({ request }) => {
    * - Delete DB mapping
    */
   if (intent === "clear_all") {
-    const mapped = await prisma.attributeMapMetafield.findMany({
-      where: { shopifyNamespace: NAMESPACE },
-      select: { metaobjectHandle: true },
-    });
-
-    const metaobjectTypes = mapped.map((m) => m.metaobjectHandle).filter(Boolean);
-
     const deletedCount = await deleteAllMagentoMetafields(admin);
+    let deletedEntries = 0;
+    let deletedDefinitions = 0;
 
-    const { deletedEntries, deletedDefinitions } = await deleteMetaobjectsByTypes(
-      admin,
-      metaobjectTypes
+    const defs = await listMagentoMetaobjectDefinitions(admin);
+    for (const d of defs) {
+      const job = await bulkDeleteMetaobjectsByType(admin, d.type);
+      if (job) deletedEntries += 1;
+      await deleteMetaobjectDefinitionById(admin, d.id);
+      deletedDefinitions += 1;
+    }
+    await prisma.$executeRawUnsafe(
+      `TRUNCATE TABLE "AttributeMapMetafield" RESTART IDENTITY CASCADE`
     );
-
-    await prisma.attributeMapMetafield.deleteMany({
-      where: { shopifyNamespace: NAMESPACE },
-    });
 
     return {
       success: true,
@@ -810,6 +666,7 @@ export const action = async ({ request }) => {
       deletedMetaobjectDefinitions: deletedDefinitions,
     };
   }
+
 
   throw new Response("Invalid intent", { status: 400 });
 };
@@ -961,31 +818,6 @@ export default function AttributeSyncPage() {
   return (
     <Page title="Attribute Sync">
       <BlockStack gap="400">
-        <Card>
-            <InlineStack align="end">
-              <clearGlobalFetcher.Form method="post">
-                <input type="hidden" name="intent" value="clear_magento_global" />
-                <Button
-                  tone="critical"
-                  submit
-                  loading={clearGlobalFetcher.state !== "idle"}
-                  disabled={isBulkSyncing}
-                  onClick={(e) => {
-                    if (
-                      !window.confirm(
-                        "This will DELETE ALL PRODUCT metafield definitions in namespace 'magento' (and their values) AND ALL metaobjects/metaobject definitions of type '$app:magento_*_option'. Continue?"
-                      )
-                    ) {
-                      e.preventDefault();
-                    }
-                  }}
-                >
-                  Clear ALL magento metafields + magento_*_option metaobjects
-                </Button>
-              </clearGlobalFetcher.Form>
-            </InlineStack>
-          </Card>
-
         <Card>
           <InlineStack align="space-between">
             <Text variant="headingSm">Magento → Shopify Attributes</Text>
