@@ -1,5 +1,5 @@
 // app/routes/app.product.jsx
-import { Pagination, TextField  } from "@shopify/polaris";
+import { Pagination, TextField, Banner   } from "@shopify/polaris";
 import he from "he";
 import { useFetcher } from "react-router";
 import { useEffect, useState } from "react";
@@ -66,19 +66,14 @@ function htmlToPlainText(html, he) {
 }
 
 function pickErrorIndexFromUserError(field) {
-  // Shopify hay trả field dạng:
-  // ["metafields", "3", "value"] hoặc ["metafields", "3", "type"]
   if (!Array.isArray(field)) return null;
   const i = field.find((x) => typeof x === "string" && /^\d+$/.test(x));
   return i != null ? Number(i) : null;
 }
-
 function shortValue(v, max = 160) {
   const s = typeof v === "string" ? v : JSON.stringify(v);
-  if (s.length <= max) return s;
-  return s.slice(0, max) + "…";
+  return s.length <= max ? s : s.slice(0, max) + "…";
 }
-
 
 // Shopify rich_text_field expects JSON document
 function toShopifyRichTextJSONFromHtml(html, he) {
@@ -216,39 +211,25 @@ async function metafieldsSet(admin, metafields, { debugLabel = "" } = {}) {
   const json = await res.json();
   const errs = json?.data?.metafieldsSet?.userErrors ?? [];
 
-  if (!errs.length) return;
+  if (!errs.length) return { ok: true, errors: [] };
 
-  // ✅ log chi tiết: lỗi nào, thuộc metafield nào trong batch
-  console.error(`[metafieldsSet] ${debugLabel} Got ${errs.length} userErrors`);
-
-  for (const e of errs) {
+  const details = errs.map((e) => {
     const idx = pickErrorIndexFromUserError(e.field);
     const input = idx != null ? metafields[idx] : null;
 
-    console.error(`[metafieldsSet] ERROR`, {
+    return {
+      debugLabel,
       message: e.message,
       field: e.field,
-      // context của metafield
       ownerId: input?.ownerId,
       namespace: input?.namespace,
       key: input?.key,
       type: input?.type,
-      value: input ? shortValue(input.value) : undefined,
-      // dump raw input nếu idx không parse được
-      input,
-    });
-  }
+      value: input ? shortValue(input.value) : null,
+    };
+  });
 
-  // ✅ throw hẳn ra nhưng kèm context dễ debug
-  const first = errs[0];
-  const idx = pickErrorIndexFromUserError(first.field);
-  const input = idx != null ? metafields[idx] : null;
-
-  const ctx = input
-    ? `${input.namespace}.${input.key} (${input.type}) value=${shortValue(input.value)}`
-    : `unknown input; field=${JSON.stringify(first.field)}`;
-
-  throw new Error(`[metafieldsSet] ${first.message} | ${ctx}`);
+  return { ok: false, errors: details };
 }
 
 
@@ -315,85 +296,71 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
       continue;
     }
 
-    // ---- list.single_line_text_field ----
-    if (type === "list.single_line_text_field") {
-      const parts = splitMulti(pickMagentoValue(a));
-      if (!parts.length) continue;
-      mfInputs.push({
-        ownerId: shopifyProductId,
-        namespace: ns,
-        key,
-        type,
-        value: JSON.stringify(parts),
-      });
-      continue;
-    }
+    // ---- single_line_text_field (select -> choice list) ----
+    if (type === "single_line_text_field") {
+      let v = pickMagentoValue(a); // ✅ lấy label
 
-  // ---- single_line_text_field (select -> choice list) ----
-  if (type === "single_line_text_field") {
-    let v = pickMagentoValue(a); // ✅ lấy label
-
-    v = heLib ? heLib.decode(v) : v;
-    v = v
-      .replace(/<br\s*\/?>/gi, " ")
-      .replace(/<\/?[^>]+>/g, "")
-      .replace(/[\r\n]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (v.length > 255) v = v.slice(0, 255);
-    if (!v) continue;
-
-    mfInputs.push({
-      ownerId: shopifyProductId,
-      namespace: ns,
-      key,
-      type,
-      value: v, // ✅ label
-    });
-
-    continue;
-  }
-
-  // ---- list.single_line_text_field (multiselect -> choice list) ----
-  if (type === "list.single_line_text_field") {
-    // ✅ ưu tiên label list
-    const raw = pickMagentoValue(a);
-
-    // Magento có thể trả "A,B,C" hoặc "A, B, C"
-    const parts = splitMulti(raw);
-
-    // sanitize + dedupe
-    const seen = new Set();
-    const cleaned = [];
-    for (let p of parts) {
-      p = heLib ? heLib.decode(p) : p;
-      p = p
+      v = heLib ? heLib.decode(v) : v;
+      v = v
         .replace(/<br\s*\/?>/gi, " ")
         .replace(/<\/?[^>]+>/g, "")
         .replace(/[\r\n]+/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 
-      if (!p) continue;
-      const k = p.toLowerCase();
-      if (seen.has(k)) continue;
-      seen.add(k);
-      cleaned.push(p);
+      if (v.length > 255) v = v.slice(0, 255);
+      if (!v) continue;
+
+      mfInputs.push({
+        ownerId: shopifyProductId,
+        namespace: ns,
+        key,
+        type,
+        value: v, // ✅ label
+      });
+
+      continue;
     }
 
-    if (!cleaned.length) continue;
+    // ---- list.single_line_text_field (multiselect -> choice list) ----
+    if (type === "list.single_line_text_field") {
+      // ✅ ưu tiên label list
+      const raw = pickMagentoValue(a);
 
-    mfInputs.push({
-      ownerId: shopifyProductId,
-      namespace: ns,
-      key,
-      type,
-      value: JSON.stringify(cleaned), // ✅ ["Volltür","Glastür"]
-    });
+      // Magento có thể trả "A,B,C" hoặc "A, B, C"
+      const parts = splitMulti(raw);
 
-    continue;
-  }
+      // sanitize + dedupe
+      const seen = new Set();
+      const cleaned = [];
+      for (let p of parts) {
+        p = heLib ? heLib.decode(p) : p;
+        p = p
+          .replace(/<br\s*\/?>/gi, " ")
+          .replace(/<\/?[^>]+>/g, "")
+          .replace(/[\r\n]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        if (!p) continue;
+        const k = p.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        cleaned.push(p);
+      }
+
+      if (!cleaned.length) continue;
+
+      mfInputs.push({
+        ownerId: shopifyProductId,
+        namespace: ns,
+        key,
+        type,
+        value: JSON.stringify(cleaned), // ✅ ["Volltür","Glastür"]
+      });
+
+      continue;
+    }
 
     // ---- default text/textarea/number_decimal/... ----
     const v = pickMagentoValue(a);
@@ -411,13 +378,23 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
   if (!mfInputs.length) return { updated: 0 };
 
   // 5) metafieldsSet theo chunk
+  if (!mfInputs.length) return { updated: 0, errors: [] };
   const batches = chunk(mfInputs, 25);
+  const errors = [];
+
   for (let i = 0; i < batches.length; i++) {
-    await metafieldsSet(admin, batches[i], {
+    const r = await metafieldsSet(admin, batches[i], {
       debugLabel: `product=${shopifyProductId} batch=${i + 1}/${batches.length}`,
     });
+
+    if (!r.ok) {
+      errors.push(...r.errors);
+      // nếu muốn dừng ngay khi có lỗi, uncomment dòng dưới:
+      // break;
+    }
   }
-  return { updated: mfInputs.length };
+
+  return { updated: mfInputs.length, errors };
 }
 
 /**
@@ -891,7 +868,7 @@ export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
-  const locationId = await getFirstLocationId(admin);
+  // const locationId = await getFirstLocationId(admin);
 
   const intentsNeedMagento = new Set(["fetch", "sync", "resync"]);
   let MAGENTO_BASE = null;
@@ -1050,11 +1027,23 @@ export const action = async ({ request }) => {
         replaceExisting: intent === "resync",
     });
 
-    await syncMagentoCustomAttributesToProductMetafields(MAGENTO_BASE, admin, {
+    const mfResult = await syncMagentoCustomAttributesToProductMetafields(MAGENTO_BASE, admin, {
       magentoProductId,
       shopifyProductId: base.productId,
-      heLib: he, // bạn đã import he
+      heLib: he,
     });
+
+    if (mfResult?.errors?.length) {
+      // ✅ trả về để show trên page
+      return {
+        success: false,
+        intent,
+        magentoProductId,
+        shopifyProductId: base.productId,
+        errorType: "METAFIELD_SET_ERRORS",
+        debugErrors: mfResult.errors,
+      };
+    }
 
     // 6) publish product
     await publishProduct(admin, base.productId);
@@ -1101,26 +1090,51 @@ export const action = async ({ request }) => {
  * ======================
  */
 
-function RowActions({ item, onDone, disabled, shopify }) {
+function RowActions({ item, onDone, disabled, shopify, onError, onClearError }) {
   const syncFetcher = useFetcher();
   const resyncFetcher = useFetcher();
 
   const syncing = syncFetcher.state === "loading" || syncFetcher.state === "submitting";
   const resyncing = resyncFetcher.state === "loading" || resyncFetcher.state === "submitting";
 
+  const errData =
+    (syncFetcher.data?.success === false && syncFetcher.data?.errorType === "METAFIELD_SET_ERRORS"
+      ? syncFetcher.data
+      : null) ||
+    (resyncFetcher.data?.success === false && resyncFetcher.data?.errorType === "METAFIELD_SET_ERRORS"
+      ? resyncFetcher.data
+      : null);
+
+  useEffect(() => {
+    if (errData) {
+      onError?.({
+        ...errData,
+        magentoProductId: item.magentoProductId,
+        name: item.name,
+      });
+    }
+  }, [errData, onError, item.magentoProductId, item.name]);
+
+  useEffect(() => {
+    if (syncFetcher.state === "submitting" || resyncFetcher.state === "submitting") {
+      onClearError?.();
+    }
+  }, [syncFetcher.state, resyncFetcher.state, onClearError]);
+
   useEffect(() => {
     if (syncFetcher.state === "idle" && syncFetcher.data?.success) {
       shopify.toast.show("Product synced");
       onDone();
     }
-  }, [syncFetcher.state]);
+  }, [syncFetcher.state, syncFetcher.data, shopify, onDone]);
 
   useEffect(() => {
     if (resyncFetcher.state === "idle" && resyncFetcher.data?.success) {
       shopify.toast.show("Product re-synced");
       onDone();
     }
-  }, [resyncFetcher.state]);
+  }, [resyncFetcher.state, resyncFetcher.data, shopify, onDone]);
+
 
   const HiddenFields = () => (
     <>
@@ -1181,7 +1195,7 @@ export default function ProductPage() {
   const [pageInputFocusValue, setPageInputFocusValue] = useState("");
   const items = fetcher.data?.items ?? [];
 
-  
+   const [mfError, setMfError] = useState(null);
 
   // test sync 10
   const unsyncedItems = items.filter((i) => !i.isSynced);//.slice(0, 10);
@@ -1224,7 +1238,7 @@ export default function ProductPage() {
 
   const resyncAll = async () => {
     if (syncedItems.length === 0) return;
-
+    setMfError(null); // ✅ clear banner cũ
     setIsBulkSyncing(true);
     setProgress({ done: 0, total: syncedItems.length });
 
@@ -1244,11 +1258,21 @@ export default function ProductPage() {
       fd.append("imageUrl", item.imageUrl || "");
       fd.append("galleryJson", item.galleryJson || "");
 
-      await fetch(window.location.pathname, {
+      const resp = await fetch(window.location.pathname, {
         method: "POST",
         body: fd,
       });
 
+      let json = null;
+      try {
+        json = await resp.json();
+      } catch {}
+
+      if (json?.success === false && json?.errorType === "METAFIELD_SET_ERRORS") {
+        setMfError({ ...json, magentoProductId: item.magentoProductId, name: item.name });
+        setIsBulkSyncing(false);
+        return; // ✅ dừng luôn (tuỳ bạn)
+      }
       setProgress((p) => ({ ...p, done: p.done + 1 }));
     }
 
@@ -1259,7 +1283,7 @@ export default function ProductPage() {
 
   const syncAll = async () => {
     if (unsyncedItems.length === 0) return;
-
+    setMfError(null); // ✅ clear banner cũ
     setIsBulkSyncing(true);
     setProgress({ done: 0, total: unsyncedItems.length });
 
@@ -1277,12 +1301,23 @@ export default function ProductPage() {
       fd.append("metaDescription", item.metaDescription || "");
       fd.append("imageUrl", item.imageUrl || "");
       fd.append("galleryJson", item.galleryJson || "");
+      fd.append("weight", item.weight ?? 0);
 
-      await fetch(window.location.pathname, {
+      const resp = await fetch(window.location.pathname, {
         method: "POST",
         body: fd,
       });
 
+      let json = null;
+      try {
+        json = await resp.json();
+      } catch {}
+
+      if (json?.success === false && json?.errorType === "METAFIELD_SET_ERRORS") {
+        setMfError({ ...json, magentoProductId: item.magentoProductId, name: item.name });
+        setIsBulkSyncing(false);
+        return; // ✅ dừng luôn (tuỳ bạn)
+      }
       setProgress((p) => ({ ...p, done: p.done + 1 }));
     }
 
@@ -1325,6 +1360,29 @@ export default function ProductPage() {
 
   return (
     <Page title="Magento → Shopify Products">
+      {mfError && (
+        <Banner
+          title="Metafield sync errors"
+          tone="critical"
+          onDismiss={() => setMfError(null)}
+        >
+          <p>Some metafields failed to set. Details:</p>
+          <ul>
+            {(mfError.debugErrors ?? []).slice(0, 15).map((e, idx) => (
+              <li key={idx}>
+                <strong>{e.namespace}.{e.key}</strong> ({e.type}) — {e.message}
+                <div style={{ opacity: 0.8 }}>
+                  value: <code>{e.value}</code>
+                </div>
+              </li>
+            ))}
+          </ul>
+          {(mfError.debugErrors?.length ?? 0) > 15 && (
+            <p>Showing first 15 errors. Total: {mfError.debugErrors.length}</p>
+          )}
+        </Banner>
+      )}
+
       <BlockStack gap="400">
         <Card>
           <InlineStack align="space-between">
@@ -1450,6 +1508,8 @@ export default function ProductPage() {
                         item={item}
                         onDone={() => handleFetch(page)} 
                         disabled={isBulkSyncing}
+                        onError={(data) => setMfError(data)} 
+                        onClearError={() => setMfError(null)}
                         shopify={shopify}
                       />
                     </IndexTable.Cell>
