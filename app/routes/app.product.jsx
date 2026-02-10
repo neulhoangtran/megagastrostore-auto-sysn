@@ -65,6 +65,21 @@ function htmlToPlainText(html, he) {
     .trim();
 }
 
+function pickErrorIndexFromUserError(field) {
+  // Shopify hay trả field dạng:
+  // ["metafields", "3", "value"] hoặc ["metafields", "3", "type"]
+  if (!Array.isArray(field)) return null;
+  const i = field.find((x) => typeof x === "string" && /^\d+$/.test(x));
+  return i != null ? Number(i) : null;
+}
+
+function shortValue(v, max = 160) {
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  if (s.length <= max) return s;
+  return s.slice(0, max) + "…";
+}
+
+
 // Shopify rich_text_field expects JSON document
 function toShopifyRichTextJSONFromHtml(html, he) {
   const text = htmlToPlainText(html, he);
@@ -187,7 +202,7 @@ async function getMetaobjectOptionIdMap(admin, { metaobjectType, cache }) {
 // =========
 // Shopify GraphQL: metafieldsSet (chunked outside)
 // =========
-async function metafieldsSet(admin, metafields) {
+async function metafieldsSet(admin, metafields, { debugLabel = "" } = {}) {
   const res = await admin.graphql(
     `#graphql
     mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
@@ -200,8 +215,42 @@ async function metafieldsSet(admin, metafields) {
 
   const json = await res.json();
   const errs = json?.data?.metafieldsSet?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
+
+  if (!errs.length) return;
+
+  // ✅ log chi tiết: lỗi nào, thuộc metafield nào trong batch
+  console.error(`[metafieldsSet] ${debugLabel} Got ${errs.length} userErrors`);
+
+  for (const e of errs) {
+    const idx = pickErrorIndexFromUserError(e.field);
+    const input = idx != null ? metafields[idx] : null;
+
+    console.error(`[metafieldsSet] ERROR`, {
+      message: e.message,
+      field: e.field,
+      // context của metafield
+      ownerId: input?.ownerId,
+      namespace: input?.namespace,
+      key: input?.key,
+      type: input?.type,
+      value: input ? shortValue(input.value) : undefined,
+      // dump raw input nếu idx không parse được
+      input,
+    });
+  }
+
+  // ✅ throw hẳn ra nhưng kèm context dễ debug
+  const first = errs[0];
+  const idx = pickErrorIndexFromUserError(first.field);
+  const input = idx != null ? metafields[idx] : null;
+
+  const ctx = input
+    ? `${input.namespace}.${input.key} (${input.type}) value=${shortValue(input.value)}`
+    : `unknown input; field=${JSON.stringify(first.field)}`;
+
+  throw new Error(`[metafieldsSet] ${first.message} | ${ctx}`);
 }
+
 
 async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin, {
   magentoProductId,
@@ -363,10 +412,11 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
 
   // 5) metafieldsSet theo chunk
   const batches = chunk(mfInputs, 25);
-  for (const batch of batches) {
-    await metafieldsSet(admin, batch);
+  for (let i = 0; i < batches.length; i++) {
+    await metafieldsSet(admin, batches[i], {
+      debugLabel: `product=${shopifyProductId} batch=${i + 1}/${batches.length}`,
+    });
   }
-
   return { updated: mfInputs.length };
 }
 
