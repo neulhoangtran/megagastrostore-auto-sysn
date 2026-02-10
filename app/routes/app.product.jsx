@@ -226,10 +226,6 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
 
   const mapByCode = new Map(maps.map((m) => [m.magentoAttributeCode, m]));
 
-  // 3) metaobject defs cache (resolve type thật)
-  const defs = await listAllMetaobjectDefinitions(admin);
-  const metaobjectOptionCache = new Map(); // realType -> Map(label/value -> id)
-
   // 4) build metafields inputs
   const mfInputs = [];
 
@@ -243,58 +239,6 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
     const type = m.shopifyType;
     const ns = m.shopifyNamespace || "magento";
     const key = m.shopifyKey;
-
-    // ---- metaobject reference (select/multiselect) ----
-    if (type === "metaobject_reference" || type === "list.metaobject_reference") {
-      const handle = m.metaobjectHandle;
-      if (!handle) continue;
-
-      const realType = resolveMetaobjectTypeFromHandle(defs, handle);
-      console.log("resolve metaobject", {
-        handle,
-        defs,
-        realType,
-      });
-
-      if (!realType) continue;
-
-      const optionMap = await getMetaobjectOptionIdMap(admin, {
-        metaobjectType: realType,
-        cache: metaobjectOptionCache,
-      });
-
-      const raw = pickMagentoValue(a);
-
-      if (type === "metaobject_reference") {
-        const id = optionMap.get(raw) || optionMap.get(String(a?.value ?? "").trim());
-        if (!id) continue;
-
-        mfInputs.push({
-          ownerId: shopifyProductId,
-          namespace: ns,
-          key,
-          type,
-          value: id,
-        });
-      } else {
-        const parts = splitMulti(a?.value_label ?? a?.value);
-        const ids = parts
-          .map((p) => optionMap.get(p) || optionMap.get(String(p)))
-          .filter(Boolean);
-
-        if (!ids.length) continue;
-
-        mfInputs.push({
-          ownerId: shopifyProductId,
-          namespace: ns,
-          key,
-          type,
-          value: JSON.stringify(ids),
-        });
-      }
-
-      continue;
-    }
 
     // ---- boolean ----
     if (type === "boolean") {
@@ -336,14 +280,11 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
       continue;
     }
 
-    // ---- single_line_text_field ----
+  // ---- single_line_text_field (select -> choice list) ----
   if (type === "single_line_text_field") {
-    let v = pickMagentoValue(a);
+    let v = pickMagentoValue(a); // ✅ lấy label
 
-    // decode HTML entities
     v = heLib ? heLib.decode(v) : v;
-
-    // remove html
     v = v
       .replace(/<br\s*\/?>/gi, " ")
       .replace(/<\/?[^>]+>/g, "")
@@ -351,11 +292,7 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
       .replace(/\s+/g, " ")
       .trim();
 
-    // Shopify limit
-    if (v.length > 255) {
-      v = v.slice(0, 255);
-    }
-
+    if (v.length > 255) v = v.slice(0, 255);
     if (!v) continue;
 
     mfInputs.push({
@@ -363,7 +300,47 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
       namespace: ns,
       key,
       type,
-      value: v,
+      value: v, // ✅ label
+    });
+
+    continue;
+  }
+
+  // ---- list.single_line_text_field (multiselect -> choice list) ----
+  if (type === "list.single_line_text_field") {
+    // ✅ ưu tiên label list
+    const raw = pickMagentoValue(a);
+
+    // Magento có thể trả "A,B,C" hoặc "A, B, C"
+    const parts = splitMulti(raw);
+
+    // sanitize + dedupe
+    const seen = new Set();
+    const cleaned = [];
+    for (let p of parts) {
+      p = heLib ? heLib.decode(p) : p;
+      p = p
+        .replace(/<br\s*\/?>/gi, " ")
+        .replace(/<\/?[^>]+>/g, "")
+        .replace(/[\r\n]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (!p) continue;
+      const k = p.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      cleaned.push(p);
+    }
+
+    if (!cleaned.length) continue;
+
+    mfInputs.push({
+      ownerId: shopifyProductId,
+      namespace: ns,
+      key,
+      type,
+      value: JSON.stringify(cleaned), // ✅ ["Volltür","Glastür"]
     });
 
     continue;
@@ -405,9 +382,9 @@ function toBooleanString(v) {
 
 // dùng cho text/textarea/number...
 function pickMagentoValue(attr) {
-  // ưu tiên value_label nếu có (select thường có label)
+  // ưu tiên value_label nếu có (select/multiselect cần label để match choice list)
   const v = attr?.value_label ?? attr?.value;
-  return v == null ? "" : String(v);
+  return v == null ? "" : String(v).trim();
 }
 
 // multiselect thường trả "1,2,3" hoặc label "A,B,C"
