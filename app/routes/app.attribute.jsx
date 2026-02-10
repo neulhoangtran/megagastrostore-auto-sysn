@@ -29,23 +29,41 @@ const MAGENTO_ATTR_API =
 
 function toShopifySafeText(value) {
   return String(value ?? "")
-    // remove all control chars
+    // remove all ASCII control chars
     .replace(/[\u0000-\u001F\u007F]/g, "")
-    // remove HTML line breaks
+    // remove HTML breaks just in case
     .replace(/<br\s*\/?>/gi, " ")
     // collapse whitespace
     .replace(/\s+/g, " ")
     .trim();
 }
+function buildChoiceListFromMagentoOptions(options) {
+  if (!Array.isArray(options)) return [];
+
+  const seen = new Set();
+  const out = [];
+
+  for (const o of options) {
+    const s = toShopifySafeText(o?.label);
+    if (!s) continue;
+
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+
+    out.push(s); // ✅ chỉ string
+  }
+
+  // Shopify limit: tối đa 128 choices
+  return out.slice(0, 128);
+}
 
 function toShopifyChoiceJson(choices) {
-  return JSON.stringify(
-    choices.map((c) => ({
-      label: toShopifySafeText(c.label),
-      value: toShopifySafeText(c.value),
-    }))
-  );
+  // choices: string[]
+  const arr = Array.isArray(choices) ? choices : [];
+  return JSON.stringify(arr.map(toShopifySafeText));
 }
+
 
 function mapMagentoInputToShopifyType(frontendInput, attributeCode) {
   // ưu tiên theo code
@@ -76,6 +94,40 @@ function toSingleLineJson(value) {
 function isSelectInput(input) {
   return input === "select" || input === "multiselect";
 }
+
+async function deleteMetafieldDefinitionByNamespaceKey(admin, { namespace, key }) {
+  const res = await admin.graphql(
+    `#graphql
+    query($namespace: String!, $key: String!) {
+      metafieldDefinitions(ownerType: PRODUCT, first: 1, namespace: $namespace, key: $key) {
+        nodes { id }
+      }
+    }`,
+    { variables: { namespace, key } }
+  );
+
+  const json = await res.json();
+  const id = json?.data?.metafieldDefinitions?.nodes?.[0]?.id;
+  if (!id) return false;
+
+  const delRes = await admin.graphql(
+    `#graphql
+    mutation($id: ID!) {
+      metafieldDefinitionDelete(id: $id, deleteAllAssociatedMetafields: true) {
+        deletedDefinitionId
+        userErrors { message }
+      }
+    }`,
+    { variables: { id } }
+  );
+
+  const delJson = await delRes.json();
+  const errs = delJson?.data?.metafieldDefinitionDelete?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+
+  return true;
+}
+
 
 async function deleteAllMagentoMetafieldDefinitions(admin) {
   const res = await admin.graphql(
@@ -253,14 +305,7 @@ async function getExistingMagentoMetafieldKeys(admin) {
   const defs = json?.data?.metafieldDefinitions?.nodes ?? [];
   return new Set(defs.map((d) => `${d.namespace}.${d.key}`));
 }
-
-async function createMetafieldDefinition(admin, {
-  key,
-  name,
-  type,
-  choices = null,
-}) {
-  
+async function createMetafieldDefinition(admin, { key, name, type, choices = null }) {
   const def = {
     ownerType: "PRODUCT",
     namespace: NAMESPACE,
@@ -270,42 +315,31 @@ async function createMetafieldDefinition(admin, {
   };
 
   if (Array.isArray(choices) && choices.length > 0) {
-    const choiceJson = toShopifyChoiceJson(choices);
+    // ✅ value phải là single_line_text_field (1 dòng)
+    // ✅ format đúng docs: ["red","green","blue"]
+    const choiceValue = toShopifyChoiceJson(choices)
+      .replace(/[\u0000-\u001F\u007F]/g, "") // remove control chars
+      .replace(/\r?\n/g, "")                 // remove newline
+      .trim();
 
-    if (choiceJson.length <= 255) {
-      def.validations = [
-        {
-          name: "choices",
-          value: choiceJson,
-        },
-      ];
-    } else {
-      console.warn(
-        `[Shopify] Skip choices for ${key} – too many options (${choices.length})`
-      );
-    }
+    def.validations = [{ name: "choices", value: choiceValue }];
   }
-
-
 
   const res = await admin.graphql(
     `#graphql
     mutation CreateDef($def: MetafieldDefinitionInput!) {
       metafieldDefinitionCreate(definition: $def) {
-        userErrors { message }
+        userErrors { field message }
       }
     }`,
-    {
-      variables: {
-        def: def,
-      },
-    }
+    { variables: { def } }
   );
 
   const json = await res.json();
   const errors = json?.data?.metafieldDefinitionCreate?.userErrors ?? [];
   if (errors.length) throw new Error(errors[0].message);
 }
+
 
 async function deleteAllMagentoMetafields(admin) {
   const res = await admin.graphql(
@@ -554,17 +588,11 @@ export const action = async ({ request }) => {
       // ====== CHUYỂN HƯỚNG SANG CHOICE LIST ======
       shopifyType = mapSelectInputToMetafieldType(input);
 
-      // 🔥 FETCH MAGENTO OPTIONS
       const attr = await fetchMagentoAttributeByCode(MAGENTO_BASE, code);
       const options = Array.isArray(attr?.values) ? attr.values : [];
 
-      choices = options
-        .filter(o => o?.label)
-        .map(o => ({
-          label: String(o.label).trim(),
-          value: String(o.value ?? o.label).trim(),
-        }));
-
+      // ✅ label=value + dedupe + sanitize
+      choices = buildChoiceListFromMagentoOptions(options);
       /**
        * ⚠️ LOGIC METAOBJECT CŨ – GIỮ NGUYÊN NHƯNG KHÔNG GỌI
        * (để rollback / backward compatibility)
@@ -585,7 +613,7 @@ export const action = async ({ request }) => {
      * → PHẢI XOÁ DEFINITION TRƯỚC
      */
     if (intent === "resync") {
-      await deleteAllMagentoMetafieldDefinitions(admin);
+      await deleteMetafieldDefinitionByNamespaceKey(admin, { namespace: NAMESPACE, key: code });
     }
 
     /**
@@ -725,7 +753,7 @@ function RowActions({ item, onDone, disabled, shopify }) {
         </Button>
       </syncFetcher.Form>
 
-      <resyncFetcher.Form method="post">
+      {/* <resyncFetcher.Form method="post">
         <input type="hidden" name="intent" value="resync" />
         <input type="hidden" name="code" value={item.code} />
         <input type="hidden" name="label" value={item.label || ""} />
@@ -739,7 +767,7 @@ function RowActions({ item, onDone, disabled, shopify }) {
         >
           Re-sync
         </Button>
-      </resyncFetcher.Form>
+      </resyncFetcher.Form> */}
     </InlineStack>
   );
 }
