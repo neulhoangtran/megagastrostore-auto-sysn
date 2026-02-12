@@ -23,6 +23,16 @@ import {
  * ======================
  */
 
+const NO_CHOICE_CODES = new Set([
+  "Breite_nav",
+]);
+
+function shouldUseChoices({ input, code }) {
+  if (!isSelectInput(input)) return false;
+  if (NO_CHOICE_CODES.has(code)) return false;
+  return true;
+}
+
 const NAMESPACE = "magento";
 const MAGENTO_ATTR_API =
   "/rest/V1/shopify/product_attr";
@@ -584,7 +594,7 @@ export const action = async ({ request }) => {
     // ====== NEW: choice list ======
     let choices = null;
 
-    if (isSelectInput(input)) {
+    if (shouldUseChoices({ input, code })) {
       // ====== CHUYỂN HƯỚNG SANG CHOICE LIST ======
       shopifyType = mapSelectInputToMetafieldType(input);
 
