@@ -1209,7 +1209,7 @@ export default function ProductPage() {
     }
     setPage(nextPage);
     fetcher.submit(
-      { intent: "fetch", page: String(nextPage), page_size: "500",product_id: String(nextProductId || "").trim(), },
+      { intent: "fetch", page: String(nextPage), page_size: "20",product_id: String(nextProductId || "").trim(), },
       { method: "POST" }
     );
   };
@@ -1219,9 +1219,9 @@ export default function ProductPage() {
       page: fetcher.data.page ?? 1,
       totalPage: fetcher.data.total_page ?? 1,
       total: fetcher.data.total ?? 0,
-      pageSize: fetcher.data.page_size ?? 500,
+      pageSize: fetcher.data.page_size ?? 20,
     }
-  : { page: 1, totalPage: 1, total: 0, pageSize: 500 };
+  : { page: 1, totalPage: 1, total: 0, pageSize: 20 };
 
   useEffect(() => {
     if (fetcher.state === "idle" && fetcher.data?.page != null) {
