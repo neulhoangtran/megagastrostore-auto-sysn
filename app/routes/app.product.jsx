@@ -890,7 +890,7 @@ export const action = async ({ request }) => {
    */
   if (intent === "fetch") {
     const page = Number(formData.get("page")) || 1;
-    const pageSize = Number(formData.get("page_size")) || 500;
+    const pageSize = Number(formData.get("page_size")) || 20;
     const url = new URL(`${MAGENTO_BASE}/rest/V1/shopify/products`);
     url.searchParams.set("page", String(page));
     url.searchParams.set("page_size", String(pageSize));
