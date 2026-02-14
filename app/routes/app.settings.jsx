@@ -130,7 +130,8 @@ export const action = async ({ request }) => {
     });
     const settings = Object.fromEntries(rows.map((r) => [r.key, r.value]));
 
-    const magentoUrl = settings.magento_url || "";
+    // const magentoUrl = settings.magento_url || "";
+    const magentoUrl = "http://dev.megagastrostore.de";
     const endpoint = "/rest/V1/shopify/get-list-shopify-product-id";
     const token = settings.magento_token || "";
 
