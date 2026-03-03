@@ -163,35 +163,6 @@ export const action = async ({ request }) => {
     }
 
     /*
-      =========================
-      CHECK PRODUCT EXISTS
-      =========================
-      */
-    if (intent === "check-product") {
-        try {
-            const shopifyProductId = formData.get("shopifyProductId");
-
-            if (!shopifyProductId) {
-                return { success: false, exists: false };
-            }
-
-            const res = await admin.graphql(`
-        query($id: ID!) {
-            product(id: $id) { id }
-        }
-        `, { variables: { id: shopifyProductId } });
-
-            const json = await res.json();
-            const exists = Boolean(json?.data?.product?.id);
-
-            return { success: true, exists };
-
-        } catch (e) {
-            return { success: false, exists: false };
-        }
-    }
-
-    /*
     ======================
     SYNC
     ======================
@@ -283,24 +254,6 @@ export default function ProductLinkPage() {
         if (fetcher.data?.items) setItems(fetcher.data.items);
         if (fetcher.data?.success === false) setError(fetcher.data.message);
     }, [fetcher.data]);
-
-    const checkProductExists = async (shopifyId) => {
-        const fd = new FormData();
-        fd.append("intent", "check-product");
-        fd.append("shopifyProductId", shopifyId);
-
-        const res = await fetch(window.location.pathname, {
-            method: "POST",
-            body: fd
-        });
-
-        try {
-            const json = await res.json();
-            return json.exists === true;
-        } catch {
-            return false;
-        }
-    };
 
     const handleFetch = () => {
         setError(null);
