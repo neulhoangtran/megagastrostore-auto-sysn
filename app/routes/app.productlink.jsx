@@ -441,7 +441,12 @@ export default function ProductLinkPage() {
                                     >
                                         <IndexTable.Cell>{item.parent_id}</IndexTable.Cell>
                                         <IndexTable.Cell>{item.shopify_id}</IndexTable.Cell>
-                                        <IndexTable.Cell>{item.name}</IndexTable.Cell>
+                                        <IndexTable.Cell>
+                                            <div style={{ whiteSpace: "normal", maxWidth: "300px" }}>
+                                                <Text>{item.name}</Text>
+                                            </div>
+                                        </IndexTable.Cell>
+                                        
                                         <IndexTable.Cell>
                                             <Button
                                                 size="slim"
