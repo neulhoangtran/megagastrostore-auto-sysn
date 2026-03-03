@@ -4,17 +4,17 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettingOr } from "../utils/settings";
 import {
-    Page,
-    Card,
-    Button,
-    IndexTable,
-    Text,
-    InlineStack,
-    Scrollable,
-    BlockStack,
-    ProgressBar,
-    Spinner,
-    Banner
+  Page,
+  Card,
+  Button,
+  IndexTable,
+  Text,
+  InlineStack,
+  Scrollable,
+  BlockStack,
+  ProgressBar,
+  Spinner,
+  Banner,
 } from "@shopify/polaris";
 
 /*
@@ -24,7 +24,7 @@ SERVER
 */
 
 async function ensureDefinition(admin, key) {
-    const check = await admin.graphql(`
+  const check = await admin.graphql(`
     query {
       metafieldDefinitions(first: 50, ownerType: PRODUCT, namespace: "magento") {
         nodes { key }
@@ -32,219 +32,195 @@ async function ensureDefinition(admin, key) {
     }
   `);
 
-    const json = await check.json();
-    const defs = json?.data?.metafieldDefinitions?.nodes ?? [];
-    if (defs.find(d => d.key === key)) return;
+  const json = await check.json();
+  const defs = json?.data?.metafieldDefinitions?.nodes ?? [];
+  if (defs.find((d) => d.key === key)) return;
 
-    const create = await admin.graphql(`
+  const create = await admin.graphql(
+    `
     mutation Create($input: MetafieldDefinitionInput!) {
       metafieldDefinitionCreate(definition: $input) {
         userErrors { message }
       }
     }
-  `, {
-        variables: {
-            input: {
-                name: `Magento ${key}`,
-                namespace: "magento",
-                key,
-                type: "list.product_reference",
-                ownerType: "PRODUCT"
-            }
-        }
-    });
+  `,
+    {
+      variables: {
+        input: {
+          name: `Magento ${key}`,
+          namespace: "magento",
+          key,
+          type: "list.product_reference",
+          ownerType: "PRODUCT",
+        },
+      },
+    }
+  );
 
-    const createJson = await create.json();
-    const errs = createJson?.data?.metafieldDefinitionCreate?.userErrors ?? [];
-    if (errs.length) throw new Error(errs[0].message);
+  const createJson = await create.json();
+  const errs = createJson?.data?.metafieldDefinitionCreate?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
 }
+
 export const loader = async ({ request }) => {
-    await authenticate.admin(request);
-    return null;
+  await authenticate.admin(request);
+  return null;
 };
 
 export const action = async ({ request }) => {
-    const { admin } = await authenticate.admin(request);
-    const formData = await request.formData();
-    const intent = formData.get("intent");
+  const { admin } = await authenticate.admin(request);
+  const formData = await request.formData();
+  const intent = formData.get("intent");
 
-    const MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
-    if (!MAGENTO_BASE) {
-        return { success: false, message: "Magento URL not configured" };
+  if (!intent) {
+    return { success: false, message: "Missing intent" };
+  }
+
+  const MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+  if (!MAGENTO_BASE) {
+    return { success: false, message: "Magento URL not configured" };
+  }
+
+  /*
+  ======================
+  FETCH
+  ======================
+  */
+  if (intent === "fetch") {
+    try {
+      const res = await fetch(
+        `${MAGENTO_BASE}/rest/V1/shopify/product-links?page=1&pageSize=5000`
+      );
+
+      if (!res.ok) {
+        return { success: false, message: "Failed to fetch Magento links" };
+      }
+
+      const json = await res.json();
+      const rawItems = json?.items ?? [];
+
+      const maps = await prisma.productMapMagento.findMany();
+      const mapByMagentoId = new Map(
+        maps.map((m) => [m.magentoProductId, m])
+      );
+
+      const grouped = new Map();
+
+      for (const item of rawItems) {
+        const parentId = item.parent_id;
+        const linkedId = item.linked_id;
+
+        if (!grouped.has(parentId)) {
+          grouped.set(parentId, {
+            related: [],
+            upsell: [],
+            crosssell: [],
+          });
+        }
+
+        const group = grouped.get(parentId);
+        const linkedMap = mapByMagentoId.get(linkedId);
+        if (!linkedMap?.shopifyProductId) continue;
+
+        const entry = {
+          shopifyId: linkedMap.shopifyProductId,
+          position: item.position ?? 0,
+        };
+
+        if (item.link_type === "related") group.related.push(entry);
+        if (item.link_type === "upsell") group.upsell.push(entry);
+        if (item.link_type === "crosssell") group.crosssell.push(entry);
+      }
+
+      const rows = [];
+
+      for (const [parentId, group] of grouped.entries()) {
+        const parentMap = mapByMagentoId.get(parentId);
+        if (!parentMap?.shopifyProductId) continue;
+
+        const sort = (a, b) => a.position - b.position;
+
+        rows.push({
+          parent_id: parentId,
+          shopify_id: parentMap.shopifyProductId,
+          name: parentMap.name,
+          related: group.related.sort(sort).map((x) => x.shopifyId),
+          upsell: group.upsell.sort(sort).map((x) => x.shopifyId),
+          crosssell: group.crosssell.sort(sort).map((x) => x.shopifyId),
+        });
+      }
+
+      return { success: true, items: rows };
+    } catch (e) {
+      return { success: false, message: e.message };
     }
+  }
 
-    if (intent === "check-product") {
-        try {
-            const shopifyProductId = formData.get("shopifyProductId");
+  /*
+  ======================
+  SYNC
+  ======================
+  */
+  if (intent === "sync") {
+    try {
+        console.log(1111);
+      const shopifyProductId = formData.get("shopifyProductId");
+      if (!shopifyProductId) {
+        return { success: false, message: "Missing Shopify Product ID" };
+      }
 
-            if (!shopifyProductId) {
-            return { success: false, exists: false };
-            }
+      const related = JSON.parse(formData.get("related") || "[]");
+      const upsell = JSON.parse(formData.get("upsell") || "[]");
+      const crosssell = JSON.parse(formData.get("crosssell") || "[]");
+console.log(2222);
+      await ensureDefinition(admin, "related");
+      await ensureDefinition(admin, "upsell");
+      await ensureDefinition(admin, "crosssell");
+console.log(3333);
+      const metafields = [];
 
-            const res = await admin.graphql(`
-            query($id: ID!) {
-                product(id: $id) { id }
-            }
-            `, {
-            variables: { id: shopifyProductId }
-            });
+      const build = (key, list) => {
+        if (!list.length) return;
+        metafields.push({
+          ownerId: shopifyProductId,
+          namespace: "magento",
+          key,
+          type: "list.product_reference",
+          value: JSON.stringify(list),
+        });
+      };
 
-            const json = await res.json();
-            const exists = Boolean(json?.data?.product?.id);
+      build("related", related);
+      build("upsell", upsell);
+      build("crosssell", crosssell);
 
-            return { success: true, exists };
-
-        } catch (e) {
-            return { success: false, exists: false };
-        }
-        }
-
-    /*
-    ======================
-    FETCH
-    ======================
-    */
-    if (intent === "fetch") {
-        try {
-            const res = await fetch(
-                `${MAGENTO_BASE}/rest/V1/shopify/product-links?page=1&pageSize=5000`
-            );
-
-            if (!res.ok) {
-                return { success: false, message: "Failed to fetch Magento links" };
-            }
-
-            const json = await res.json();
-            const rawItems = json?.items ?? [];
-
-            const maps = await prisma.productMapMagento.findMany();
-            const mapByMagentoId = new Map(
-                maps.map(m => [m.magentoProductId, m])
-            );
-
-            const grouped = new Map();
-
-            for (const item of rawItems) {
-                const parentId = item.parent_id;
-                const linkedId = item.linked_id;
-
-                if (!grouped.has(parentId)) {
-                    grouped.set(parentId, {
-                        parent_id: parentId,
-                        related: [],
-                        upsell: [],
-                        crosssell: [],
-                    });
-                }
-
-                const group = grouped.get(parentId);
-                const linkedMap = mapByMagentoId.get(linkedId);
-                if (!linkedMap?.shopifyProductId) continue;
-
-                const entry = {
-                    shopifyId: linkedMap.shopifyProductId,
-                    position: item.position ?? 0
-                };
-
-                if (item.link_type === "related") group.related.push(entry);
-                if (item.link_type === "upsell") group.upsell.push(entry);
-                if (item.link_type === "crosssell") group.crosssell.push(entry);
-            }
-
-            const rows = [];
-
-            for (const [parentId, group] of grouped.entries()) {
-                const parentMap = mapByMagentoId.get(parentId);
-                if (!parentMap?.shopifyProductId) continue;
-
-                const sort = (a, b) => a.position - b.position;
-
-                rows.push({
-                    parent_id: parentId,
-                    shopify_id: parentMap.shopifyProductId,
-                    name: parentMap.name,
-                    related: group.related.sort(sort).map(x => x.shopifyId),
-                    upsell: group.upsell.sort(sort).map(x => x.shopifyId),
-                    crosssell: group.crosssell.sort(sort).map(x => x.shopifyId),
-                });
-            }
-
-            return { success: true, items: rows };
-
-        } catch (e) {
-            return { success: false, message: e.message };
-        }
-    }
-
-    /*
-    ======================
-    SYNC
-    ======================
-    */
-    if (intent === "sync") {
-        try {
-            const shopifyProductId = formData.get("shopifyProductId");
-            if (!shopifyProductId) {
-                return { success: false, message: "Missing Shopify Product ID" };
-            }
-
-            const exists = await checkProductExists(admin, shopifyProductId);
-            if (!exists) {
-                return {
-                    success: false,
-                    message: "Shopify product does not exist or was deleted"
-                };
-            }
-
-            const related = JSON.parse(formData.get("related") || "[]");
-            const upsell = JSON.parse(formData.get("upsell") || "[]");
-            const crosssell = JSON.parse(formData.get("crosssell") || "[]");
-
-            await ensureDefinition(admin, "related");
-            await ensureDefinition(admin, "upsell");
-            await ensureDefinition(admin, "crosssell");
-
-            const metafields = [];
-
-            const build = (key, list) => {
-                if (!list.length) return;
-                metafields.push({
-                    ownerId: shopifyProductId,
-                    namespace: "magento",
-                    key,
-                    type: "list.product_reference",
-                    value: JSON.stringify(list)
-                });
-            };
-
-            build("related", related);
-            build("upsell", upsell);
-            build("crosssell", crosssell);
-
-            if (metafields.length) {
-                const res = await admin.graphql(`
+      if (metafields.length) {
+        const res = await admin.graphql(
+          `
           mutation Set($metafields: [MetafieldsSetInput!]!) {
             metafieldsSet(metafields: $metafields) {
               userErrors { message }
             }
           }
-        `, { variables: { metafields } });
+        `,
+          { variables: { metafields } }
+        );
 
-                const json = await res.json();
-                const errs = json?.data?.metafieldsSet?.userErrors ?? [];
-                if (errs.length) {
-                    return { success: false, message: errs[0].message };
-                }
-            }
-
-            return { success: true };
-
-        } catch (e) {
-            return { success: false, message: e.message };
+        const json = await res.json();
+        console.log(json);
+        const errs = json?.data?.metafieldsSet?.userErrors ?? [];
+        if (errs.length) {
+          return { success: false, message: errs[0].message };
         }
-    }
+      }
 
-    return null;
+      return { success: true };
+    } catch (e) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  return { success: false, message: "Invalid intent" };
 };
 
 /*
@@ -254,216 +230,177 @@ CLIENT
 */
 
 export default function ProductLinkPage() {
-    const fetcher = useFetcher();
+  const fetcher = useFetcher();
 
-    const [items, setItems] = useState([]);
-    const [isSyncing, setIsSyncing] = useState(false);
-    const [progress, setProgress] = useState({ done: 0, total: 0 });
-    const [error, setError] = useState(null);
-    const [rowLoading, setRowLoading] = useState(null);
+  const [items, setItems] = useState([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [error, setError] = useState(null);
+  const [rowLoading, setRowLoading] = useState(null);
 
-    const isFetching = fetcher.state !== "idle";
+  const isFetching = fetcher.state !== "idle";
 
-    useEffect(() => {
-        if (fetcher.data?.items) setItems(fetcher.data.items);
-        if (fetcher.data?.success === false) setError(fetcher.data.message);
-    }, [fetcher.data]);
+  useEffect(() => {
+    if (fetcher.data?.items) setItems(fetcher.data.items);
+    if (fetcher.data?.success === false)
+      setError(fetcher.data.message);
+  }, [fetcher.data]);
 
-    const handleFetch = () => {
-        setError(null);
-        fetcher.submit({ intent: "fetch" }, { method: "POST" });
-    };
+  const handleFetch = () => {
+    setError(null);
+    fetcher.submit({ intent: "fetch" }, { method: "POST" });
+  };
 
-    const checkProductExistsClient = async (shopifyId) => {
-        const fd = new FormData();
-        fd.append("intent", "check-product");
-        fd.append("shopifyProductId", shopifyId);
+  const syncOne = async (item) => {
+    setError(null);
+    setRowLoading(item.parent_id);
 
-        const res = await fetch(window.location.pathname, {
-            method: "POST",
-            body: fd
-        });
+    const fd = new FormData();
+    fd.append("intent", "sync");
+    fd.append("shopifyProductId", item.shopify_id);
+    fd.append("related", JSON.stringify(item.related));
+    fd.append("upsell", JSON.stringify(item.upsell));
+    fd.append("crosssell", JSON.stringify(item.crosssell));
 
-        try {
-            const json = await res.json();
-            return json.exists === true;
-        } catch {
-            return false;
-        }
-    };
+    const res = await fetch(window.location.pathname, {
+      method: "POST",
+      body: fd,
+    });
 
-    const syncOne = async (item) => {
-        setError(null);
-        setRowLoading(item.parent_id);
+    let json;
+    try {
+      json = await res.json();
+    } catch {
+      setError("Invalid server response");
+      setRowLoading(null);
+      return;
+    }
 
-        const exists = await checkProductExistsClient(item.shopify_id);
+    if (!json.success) setError(json.message);
 
-        if (!exists) {
-            setError(`Product ${item.shopify_id} does not exist on Shopify`);
-            setRowLoading(null);
-            return;
-        }
+    setRowLoading(null);
+  };
 
-        const fd = new FormData();
-        fd.append("intent", "sync");
-        fd.append("shopifyProductId", item.shopify_id);
-        fd.append("related", JSON.stringify(item.related));
-        fd.append("upsell", JSON.stringify(item.upsell));
-        fd.append("crosssell", JSON.stringify(item.crosssell));
+  const syncAll = async () => {
+    setError(null);
+    setIsSyncing(true);
+    setProgress({ done: 0, total: items.length });
 
-        const res = await fetch(window.location.pathname, {
-            method: "POST",
-            body: fd
-        });
+    for (const item of items) {
+      const fd = new FormData();
+      fd.append("intent", "sync");
+      fd.append("shopifyProductId", item.shopify_id);
+      fd.append("related", JSON.stringify(item.related));
+      fd.append("upsell", JSON.stringify(item.upsell));
+      fd.append("crosssell", JSON.stringify(item.crosssell));
 
-        let json;
-        try {
-            json = await res.json();
-        } catch {
-            setError("Invalid server response");
-            setRowLoading(null);
-            return;
-        }
+      const res = await fetch(window.location.pathname, {
+        method: "POST",
+        body: fd,
+      });
 
-        if (!json.success) {
-            setError(json.message);
-        }
+      const json = await res.json();
 
-        setRowLoading(null);
-    };
-
-    const syncAll = async () => {
-        setError(null);
-        setIsSyncing(true);
-        setProgress({ done: 0, total: items.length });
-
-        for (const item of items) {
-
-            const exists = await checkProductExistsClient(item.shopify_id);
-
-            if (!exists) {
-                setError(`Product ${item.shopify_id} does not exist on Shopify`);
-                setIsSyncing(false);
-                return; // STOP
-            }
-
-            const fd = new FormData();
-            fd.append("intent", "sync");
-            fd.append("shopifyProductId", item.shopify_id);
-            fd.append("related", JSON.stringify(item.related));
-            fd.append("upsell", JSON.stringify(item.upsell));
-            fd.append("crosssell", JSON.stringify(item.crosssell));
-
-            const res = await fetch(window.location.pathname, {
-                method: "POST",
-                body: fd
-            });
-
-            let json;
-            try {
-                json = await res.json();
-            } catch {
-                setError("Invalid server response");
-                setIsSyncing(false);
-                return;
-            }
-
-            if (!json.success) {
-                setError(json.message);
-                setIsSyncing(false);
-                return;
-            }
-
-            setProgress(p => ({ ...p, done: p.done + 1 }));
-        }
-
+      if (!json.success) {
+        setError(json.message);
         setIsSyncing(false);
-    };
+        return;
+      }
 
-    return (
-        <Page title="Sync Product Link">
-            <BlockStack gap="400">
+      setProgress((p) => ({ ...p, done: p.done + 1 }));
+    }
 
-                {error && (
-                    <Banner tone="critical" onDismiss={() => setError(null)}>
-                        {error}
-                    </Banner>
-                )}
+    setIsSyncing(false);
+  };
 
-                <Card>
-                    <InlineStack gap="200">
-                        <Button onClick={handleFetch} loading={isFetching}>
-                            Fetch Links
-                        </Button>
+  return (
+    <Page title="Sync Product Link">
+      <BlockStack gap="400">
 
-                        <Button
-                            variant="primary"
-                            onClick={syncAll}
-                            loading={isSyncing}
-                            disabled={!items.length || isSyncing}
-                        >
-                            Sync All
-                        </Button>
-                    </InlineStack>
+        {error && (
+          <Banner tone="critical" onDismiss={() => setError(null)}>
+            {error}
+          </Banner>
+        )}
 
-                    {isSyncing && (
-                        <BlockStack gap="200">
-                            <Text>
-                                Syncing {progress.done} / {progress.total}
-                            </Text>
-                            <ProgressBar progress={(progress.done / progress.total) * 100} />
-                        </BlockStack>
-                    )}
-                </Card>
+        <Card>
+          <InlineStack gap="200">
+            <Button onClick={handleFetch} loading={isFetching}>
+              Fetch Links
+            </Button>
 
-                <Card padding="0">
-                    {isFetching ? (
-                        <div style={{ padding: 40, textAlign: "center" }}>
-                            <Spinner size="large" />
-                        </div>
-                    ) : (
-                        <Scrollable style={{ height: "650px" }}>
-                            <IndexTable
-                                itemCount={items.length}
-                                selectable={false}
-                                headings={[
-                                    { title: "Magento ID" },
-                                    { title: "Shopify ID" },
-                                    { title: "Product Name" },
-                                    { title: "Action" }
-                                ]}
-                            >
-                                {items.map((item, index) => (
-                                    <IndexTable.Row
-                                        id={String(item.parent_id)}
-                                        key={item.parent_id}
-                                        position={index}
-                                    >
-                                        <IndexTable.Cell>{item.parent_id}</IndexTable.Cell>
-                                        <IndexTable.Cell>{item.shopify_id}</IndexTable.Cell>
-                                        <IndexTable.Cell>
-                                            <div style={{ whiteSpace: "normal", maxWidth: "300px" }}>
-                                                <Text>{item.name}</Text>
-                                            </div>
-                                        </IndexTable.Cell>
-                                        
-                                        <IndexTable.Cell>
-                                            <Button
-                                                size="slim"
-                                                loading={rowLoading === item.parent_id}
-                                                onClick={() => syncOne(item)}
-                                            >
-                                                Sync
-                                            </Button>
-                                        </IndexTable.Cell>
-                                    </IndexTable.Row>
-                                ))}
-                            </IndexTable>
-                        </Scrollable>
-                    )}
-                </Card>
+            <Button
+              variant="primary"
+              onClick={syncAll}
+              loading={isSyncing}
+              disabled={!items.length || isSyncing}
+            >
+              Sync All
+            </Button>
+          </InlineStack>
 
+          {isSyncing && (
+            <BlockStack gap="200">
+              <Text>
+                Syncing {progress.done} / {progress.total}
+              </Text>
+              <ProgressBar
+                progress={(progress.done / progress.total) * 100}
+              />
             </BlockStack>
-        </Page>
-    );
+          )}
+        </Card>
+
+        <Card padding="0">
+          {isFetching ? (
+            <div style={{ padding: 40, textAlign: "center" }}>
+              <Spinner size="large" />
+            </div>
+          ) : (
+            <Scrollable style={{ height: "650px" }}>
+              <IndexTable
+                itemCount={items.length}
+                selectable={false}
+                headings={[
+                  { title: "Magento ID" },
+                  { title: "Shopify ID" },
+                  { title: "Product Name" },
+                  { title: "Action" },
+                ]}
+              >
+                {items.map((item, index) => (
+                  <IndexTable.Row
+                    id={String(item.parent_id)}
+                    key={item.parent_id}
+                    position={index}
+                  >
+                    <IndexTable.Cell>
+                      {item.parent_id}
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      {item.shopify_id}
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <div style={{ whiteSpace: "normal", maxWidth: 300 }}>
+                        <Text>{item.name}</Text>
+                      </div>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <Button
+                        size="slim"
+                        loading={rowLoading === item.parent_id}
+                        onClick={() => syncOne(item)}
+                      >
+                        Sync
+                      </Button>
+                    </IndexTable.Cell>
+                  </IndexTable.Row>
+                ))}
+              </IndexTable>
+            </Scrollable>
+          )}
+        </Card>
+      </BlockStack>
+    </Page>
+  );
 }
