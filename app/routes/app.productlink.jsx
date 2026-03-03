@@ -58,18 +58,6 @@ async function ensureDefinition(admin, key) {
     const errs = createJson?.data?.metafieldDefinitionCreate?.userErrors ?? [];
     if (errs.length) throw new Error(errs[0].message);
 }
-
-async function checkProductExists(admin, id) {
-    const res = await admin.graphql(`
-    query($id: ID!) {
-      product(id: $id) { id }
-    }
-  `, { variables: { id } });
-
-    const json = await res.json();
-    return Boolean(json?.data?.product?.id);
-}
-
 export const loader = async ({ request }) => {
     await authenticate.admin(request);
     return null;
@@ -84,6 +72,32 @@ export const action = async ({ request }) => {
     if (!MAGENTO_BASE) {
         return { success: false, message: "Magento URL not configured" };
     }
+
+    if (intent === "check-product") {
+        try {
+            const shopifyProductId = formData.get("shopifyProductId");
+
+            if (!shopifyProductId) {
+            return { success: false, exists: false };
+            }
+
+            const res = await admin.graphql(`
+            query($id: ID!) {
+                product(id: $id) { id }
+            }
+            `, {
+            variables: { id: shopifyProductId }
+            });
+
+            const json = await res.json();
+            const exists = Boolean(json?.data?.product?.id);
+
+            return { success: true, exists };
+
+        } catch (e) {
+            return { success: false, exists: false };
+        }
+        }
 
     /*
     ======================
@@ -260,11 +274,21 @@ export default function ProductLinkPage() {
         fetcher.submit({ intent: "fetch" }, { method: "POST" });
     };
 
-    const safeJson = async (res) => {
+    const checkProductExistsClient = async (shopifyId) => {
+        const fd = new FormData();
+        fd.append("intent", "check-product");
+        fd.append("shopifyProductId", shopifyId);
+
+        const res = await fetch(window.location.pathname, {
+            method: "POST",
+            body: fd
+        });
+
         try {
-            return await res.json();
+            const json = await res.json();
+            return json.exists === true;
         } catch {
-            return { success: false, message: "Invalid server response" };
+            return false;
         }
     };
 
@@ -272,7 +296,7 @@ export default function ProductLinkPage() {
         setError(null);
         setRowLoading(item.parent_id);
 
-        const exists = await checkProductExists(item.shopify_id);
+        const exists = await checkProductExistsClient(item.shopify_id);
 
         if (!exists) {
             setError(`Product ${item.shopify_id} does not exist on Shopify`);
@@ -315,7 +339,7 @@ export default function ProductLinkPage() {
 
         for (const item of items) {
 
-            const exists = await checkProductExists(item.shopify_id);
+            const exists = await checkProductExistsClient(item.shopify_id);
 
             if (!exists) {
                 setError(`Product ${item.shopify_id} does not exist on Shopify`);
