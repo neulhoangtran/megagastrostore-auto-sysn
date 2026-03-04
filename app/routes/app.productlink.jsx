@@ -329,6 +329,7 @@ export default function ProductLinkPage() {
       headers: { Accept: "application/json" },
     });
 
+    const contentType = res.headers.get("content-type") || "";
     const text = await res.text();
       console.error("Non-JSON response:", {
         status: res.status,
