@@ -326,7 +326,21 @@ export default function ProductLinkPage() {
     const res = await fetch(window.location.pathname, {
       method: "POST",
       body: fd,
+      headers: { Accept: "application/json" },
     });
+
+    const text = await res.text();
+      console.error("Non-JSON response:", {
+        status: res.status,
+        contentType,
+        snippet: text.slice(0, 300),
+      });
+      setError(
+        `text ${text} (status ${res.status}). See console for HTML snippet.`
+      );
+      setRowLoading(null);
+      return;
+
 
     let json;
     try {
