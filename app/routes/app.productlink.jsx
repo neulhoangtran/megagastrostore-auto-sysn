@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettingOr } from "../utils/settings";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import {
   Page,
   Card,
@@ -297,7 +298,7 @@ export default function ProductLinkPage() {
   // ✅ tách 2 fetcher để tránh đụng state/data giữa fetch links và sync
   const fetchLinksFetcher = useFetcher();
   const syncFetcher = useFetcher();
-
+  const shopify = useAppBridge();
   const [items, setItems] = useState([]);
   const [isSyncing, setIsSyncing] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
@@ -316,14 +317,29 @@ export default function ProductLinkPage() {
   }, [fetchLinksFetcher.data]);
 
   // apply sync result (syncOne)
-  useEffect(() => {
-    if (!syncFetcher.data) return;
+    useEffect(() => {
+      if (!syncFetcher.data) return;
 
-    if (syncFetcher.data?.success === false) setError(syncFetcher.data.message);
+      if (syncFetcher.data.success === false) {
+        setError(syncFetcher.data.message);
+      } else {
+        // ✅ toast khi sync thành công
+        const { skipped, removed } = syncFetcher.data;
 
-    // kết thúc syncOne
-    setRowLoading(null);
-  }, [syncFetcher.data]);
+        if (skipped) {
+          shopify.toast.show("Skipped: all linked products missing");
+        } else {
+          const msg =
+            removed
+              ? `Product synced (removed: r${removed.related}, u${removed.upsell}, c${removed.crosssell})`
+              : "Product synced";
+
+          shopify.toast.show(msg);
+        }
+      }
+
+      setRowLoading(null);
+    }, [syncFetcher.data, shopify]);
 
   const handleFetch = () => {
     setError(null);
