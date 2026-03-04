@@ -24,18 +24,25 @@ SERVER
 */
 
 async function ensureDefinition(admin, key) {
-  const check = await admin.graphql(`
-    query {
-      metafieldDefinitions(first: 50, ownerType: PRODUCT, namespace: "magento") {
+  const check = await admin.graphql(
+    `#graphql
+    query($key: String!) {
+      metafieldDefinitions(
+        ownerType: PRODUCT
+        first: 1
+        namespace: "magento"
+        key: $key
+      ) {
         nodes { key }
       }
-    }
-  `);
+    }`,
+    { variables: { key } }
+  );
+;
 
   const json = await check.json();
   const defs = json?.data?.metafieldDefinitions?.nodes ?? [];
   if (defs.find((d) => d.key === key)) return;
-
   const create = await admin.graphql(
     `
     mutation Create($input: MetafieldDefinitionInput!) {
@@ -163,7 +170,6 @@ export const action = async ({ request }) => {
   */
   if (intent === "sync") {
     try {
-        console.log(1111);
       const shopifyProductId = formData.get("shopifyProductId");
       if (!shopifyProductId) {
         return { success: false, message: "Missing Shopify Product ID" };
@@ -172,13 +178,64 @@ export const action = async ({ request }) => {
       const related = JSON.parse(formData.get("related") || "[]");
       const upsell = JSON.parse(formData.get("upsell") || "[]");
       const crosssell = JSON.parse(formData.get("crosssell") || "[]");
-console.log(2222);
+
+      // --- helper: check product exists ---
+      const existsProduct = async (id) => {
+        if (!id) return false;
+        const res = await admin.graphql(
+          `#graphql
+          query($id: ID!) {
+            product(id: $id) { id }
+          }`,
+          { variables: { id } }
+        );
+        const json = await res.json();
+        return Boolean(json?.data?.product?.id);
+      };
+
+      // ✅ 1) Check sản phẩm chính: không có -> STOP
+      const ownerOk = await existsProduct(shopifyProductId);
+      if (!ownerOk) {
+        return {
+          success: false,
+          message: `Owner product does not exist: ${shopifyProductId}`,
+          stop: true,
+        };
+      }
+
+      // ✅ 2) Check sản phẩm con: cái nào không có -> remove
+      // (chạy tuần tự để đơn giản; nếu list lớn mình sẽ tối ưu batch sau)
+      const filterExisting = async (ids) => {
+        const out = [];
+        for (const id of Array.isArray(ids) ? ids : []) {
+          if (await existsProduct(id)) out.push(id);
+        }
+        return out;
+      };
+
+      const relatedOk = await filterExisting(related);
+      const upsellOk = await filterExisting(upsell);
+      const crosssellOk = await filterExisting(crosssell);
+
+      // ✅ 3) Nếu tất cả con rỗng -> bỏ qua sync (không set metafield)
+      const totalChildren =
+        relatedOk.length + upsellOk.length + crosssellOk.length;
+
+      if (totalChildren === 0) {
+        return {
+          success: true,
+          skipped: true,
+          message: "All linked products missing. Skip metafieldsSet.",
+        };
+      }
+
+      // ✅ 4) ensure definition
       await ensureDefinition(admin, "related");
       await ensureDefinition(admin, "upsell");
       await ensureDefinition(admin, "crosssell");
-console.log(3333);
-      const metafields = [];
 
+      // ✅ 5) Build metafields (chỉ build list còn tồn tại)
+      const metafields = [];
       const build = (key, list) => {
         if (!list.length) return;
         metafields.push({
@@ -190,31 +247,35 @@ console.log(3333);
         });
       };
 
-      build("related", related);
-      build("upsell", upsell);
-      build("crosssell", crosssell);
+      build("related", relatedOk);
+      build("upsell", upsellOk);
+      build("crosssell", crosssellOk);
 
-      if (metafields.length) {
-        const res = await admin.graphql(
-          `
-          mutation Set($metafields: [MetafieldsSetInput!]!) {
-            metafieldsSet(metafields: $metafields) {
-              userErrors { message }
-            }
+      const res = await admin.graphql(
+        `#graphql
+        mutation Set($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            userErrors { field message }
           }
-        `,
-          { variables: { metafields } }
-        );
+        }`,
+        { variables: { metafields } }
+      );
 
-        const json = await res.json();
-        console.log(json);
-        const errs = json?.data?.metafieldsSet?.userErrors ?? [];
-        if (errs.length) {
-          return { success: false, message: errs[0].message };
-        }
+      const json = await res.json();
+      const errs = json?.data?.metafieldsSet?.userErrors ?? [];
+      if (errs.length) {
+        return { success: false, message: errs[0].message };
       }
 
-      return { success: true };
+      return {
+        success: true,
+        skipped: false,
+        removed: {
+          related: related.length - relatedOk.length,
+          upsell: upsell.length - upsellOk.length,
+          crosssell: crosssell.length - crosssellOk.length,
+        },
+      };
     } catch (e) {
       return { success: false, message: e.message };
     }
@@ -270,8 +331,8 @@ export default function ProductLinkPage() {
     let json;
     try {
       json = await res.json();
-    } catch {
-      setError("Invalid server response");
+    } catch (e) {
+      setError(e.message);
       setRowLoading(null);
       return;
     }
