@@ -890,7 +890,7 @@ export const action = async ({ request }) => {
    */
   if (intent === "fetch") {
     const page = Number(formData.get("page")) || 1;
-    const pageSize = Number(formData.get("page_size")) || 20;
+    const pageSize = Number(formData.get("page_size")) || 1000;
     const url = new URL(`${MAGENTO_BASE}/rest/V1/shopify/products`);
     url.searchParams.set("page", String(page));
     url.searchParams.set("page_size", String(pageSize));
@@ -1209,7 +1209,7 @@ export default function ProductPage() {
     }
     setPage(nextPage);
     fetcher.submit(
-      { intent: "fetch", page: String(nextPage), page_size: "20",product_id: String(nextProductId || "").trim(), },
+      { intent: "fetch", page: String(nextPage), page_size: "1000",product_id: String(nextProductId || "").trim(), },
       { method: "POST" }
     );
   };
@@ -1219,9 +1219,9 @@ export default function ProductPage() {
       page: fetcher.data.page ?? 1,
       totalPage: fetcher.data.total_page ?? 1,
       total: fetcher.data.total ?? 0,
-      pageSize: fetcher.data.page_size ?? 20,
+      pageSize: fetcher.data.page_size ?? 1000,
     }
-  : { page: 1, totalPage: 1, total: 0, pageSize: 20 };
+  : { page: 1, totalPage: 1, total: 0, pageSize: 1000 };
 
   useEffect(() => {
     if (fetcher.state === "idle" && fetcher.data?.page != null) {

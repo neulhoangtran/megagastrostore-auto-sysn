@@ -19,7 +19,7 @@ import {
  * ======================
  */
 const MAGENTO_API =
-  "http://dev.megagastrostore.de/rest/V1/shopify/product-reviews";
+  "https://www.megagastrostore.de/rest/V1/shopify/product-reviews";
 
 /**
  * ======================

@@ -40,7 +40,7 @@ const FIELDS = [
   {
     key: "magento_url",
     label: "Magento base URL",
-    placeholder: "https://dev.megagastrostore.de",
+    placeholder: "https://www.megagastrostore.de",
     helpText: "https//sample.com",
   },
   // {
@@ -131,7 +131,7 @@ export const action = async ({ request }) => {
     const settings = Object.fromEntries(rows.map((r) => [r.key, r.value]));
 
     // const magentoUrl = settings.magento_url || "";
-    const magentoUrl = "http://dev.megagastrostore.de";
+    const magentoUrl = "https://www.megagastrostore.de";
     const endpoint = "/rest/V1/shopify/get-list-shopify-product-id";
     const token = settings.magento_token || "";
 
