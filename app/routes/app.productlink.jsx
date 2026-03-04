@@ -1,5 +1,5 @@
 import { useFetcher } from "react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettingOr } from "../utils/settings";
@@ -23,6 +23,13 @@ SERVER
 =====================================
 */
 
+// ✅ React Router mode: return JSON without @remix-run/node
+const toJson = (data, init) =>
+  Response.json(data, {
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+    ...init,
+  });
+
 async function ensureDefinition(admin, key) {
   const check = await admin.graphql(
     `#graphql
@@ -38,19 +45,18 @@ async function ensureDefinition(admin, key) {
     }`,
     { variables: { key } }
   );
-;
 
   const json = await check.json();
   const defs = json?.data?.metafieldDefinitions?.nodes ?? [];
   if (defs.find((d) => d.key === key)) return;
+
   const create = await admin.graphql(
-    `
+    `#graphql
     mutation Create($input: MetafieldDefinitionInput!) {
       metafieldDefinitionCreate(definition: $input) {
         userErrors { message }
       }
-    }
-  `,
+    }`,
     {
       variables: {
         input: {
@@ -80,12 +86,12 @@ export const action = async ({ request }) => {
   const intent = formData.get("intent");
 
   if (!intent) {
-    return { success: false, message: "Missing intent" };
+    return toJson({ success: false, message: "Missing intent" });
   }
 
   const MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
   if (!MAGENTO_BASE) {
-    return { success: false, message: "Magento URL not configured" };
+    return toJson({ success: false, message: "Magento URL not configured" });
   }
 
   /*
@@ -100,16 +106,17 @@ export const action = async ({ request }) => {
       );
 
       if (!res.ok) {
-        return { success: false, message: "Failed to fetch Magento links" };
+        return toJson({
+          success: false,
+          message: "Failed to fetch Magento links",
+        });
       }
 
       const json = await res.json();
       const rawItems = json?.items ?? [];
 
       const maps = await prisma.productMapMagento.findMany();
-      const mapByMagentoId = new Map(
-        maps.map((m) => [m.magentoProductId, m])
-      );
+      const mapByMagentoId = new Map(maps.map((m) => [m.magentoProductId, m]));
 
       const grouped = new Map();
 
@@ -118,11 +125,7 @@ export const action = async ({ request }) => {
         const linkedId = item.linked_id;
 
         if (!grouped.has(parentId)) {
-          grouped.set(parentId, {
-            related: [],
-            upsell: [],
-            crosssell: [],
-          });
+          grouped.set(parentId, { related: [], upsell: [], crosssell: [] });
         }
 
         const group = grouped.get(parentId);
@@ -157,9 +160,9 @@ export const action = async ({ request }) => {
         });
       }
 
-      return { success: true, items: rows };
+      return toJson({ success: true, items: rows });
     } catch (e) {
-      return { success: false, message: e.message };
+      return toJson({ success: false, message: e?.message || String(e) });
     }
   }
 
@@ -172,7 +175,7 @@ export const action = async ({ request }) => {
     try {
       const shopifyProductId = formData.get("shopifyProductId");
       if (!shopifyProductId) {
-        return { success: false, message: "Missing Shopify Product ID" };
+        return toJson({ success: false, message: "Missing Shopify Product ID" });
       }
 
       const related = JSON.parse(formData.get("related") || "[]");
@@ -196,11 +199,11 @@ export const action = async ({ request }) => {
       // ✅ 1) Check sản phẩm chính: không có -> STOP
       const ownerOk = await existsProduct(shopifyProductId);
       if (!ownerOk) {
-        return {
+        return toJson({
           success: false,
           message: `Owner product does not exist: ${shopifyProductId}`,
           stop: true,
-        };
+        });
       }
 
       // ✅ 2) Check sản phẩm con: cái nào không có -> remove
@@ -222,11 +225,11 @@ export const action = async ({ request }) => {
         relatedOk.length + upsellOk.length + crosssellOk.length;
 
       if (totalChildren === 0) {
-        return {
+        return toJson({
           success: true,
           skipped: true,
           message: "All linked products missing. Skip metafieldsSet.",
-        };
+        });
       }
 
       // ✅ 4) ensure definition
@@ -264,10 +267,10 @@ export const action = async ({ request }) => {
       const json = await res.json();
       const errs = json?.data?.metafieldsSet?.userErrors ?? [];
       if (errs.length) {
-        return { success: false, message: errs[0].message };
+        return toJson({ success: false, message: errs[0].message });
       }
 
-      return {
+      return toJson({
         success: true,
         skipped: false,
         removed: {
@@ -275,13 +278,13 @@ export const action = async ({ request }) => {
           upsell: upsell.length - upsellOk.length,
           crosssell: crosssell.length - crosssellOk.length,
         },
-      };
+      });
     } catch (e) {
-      return { success: false, message: e.message };
+      return toJson({ success: false, message: e?.message || String(e) });
     }
   }
 
-  return { success: false, message: "Invalid intent" };
+  return toJson({ success: false, message: "Invalid intent" });
 };
 
 /*
@@ -291,7 +294,9 @@ CLIENT
 */
 
 export default function ProductLinkPage() {
-  const fetcher = useFetcher();
+  // ✅ tách 2 fetcher để tránh đụng state/data giữa fetch links và sync
+  const fetchLinksFetcher = useFetcher();
+  const syncFetcher = useFetcher();
 
   const [items, setItems] = useState([]);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -299,20 +304,33 @@ export default function ProductLinkPage() {
   const [error, setError] = useState(null);
   const [rowLoading, setRowLoading] = useState(null);
 
-  const isFetching = fetcher.state !== "idle";
+  const isFetchingLinks = fetchLinksFetcher.state !== "idle";
 
+  // apply fetch links result
   useEffect(() => {
-    if (fetcher.data?.items) setItems(fetcher.data.items);
-    if (fetcher.data?.success === false)
-      setError(fetcher.data.message);
-  }, [fetcher.data]);
+    if (!fetchLinksFetcher.data) return;
+
+    if (fetchLinksFetcher.data?.items) setItems(fetchLinksFetcher.data.items);
+    if (fetchLinksFetcher.data?.success === false)
+      setError(fetchLinksFetcher.data.message);
+  }, [fetchLinksFetcher.data]);
+
+  // apply sync result (syncOne)
+  useEffect(() => {
+    if (!syncFetcher.data) return;
+
+    if (syncFetcher.data?.success === false) setError(syncFetcher.data.message);
+
+    // kết thúc syncOne
+    setRowLoading(null);
+  }, [syncFetcher.data]);
 
   const handleFetch = () => {
     setError(null);
-    fetcher.submit({ intent: "fetch" }, { method: "POST" });
+    fetchLinksFetcher.submit({ intent: "fetch" }, { method: "POST" });
   };
 
-  const syncOne = async (item) => {
+  const syncOne = (item) => {
     setError(null);
     setRowLoading(item.parent_id);
 
@@ -323,40 +341,18 @@ export default function ProductLinkPage() {
     fd.append("upsell", JSON.stringify(item.upsell));
     fd.append("crosssell", JSON.stringify(item.crosssell));
 
-    const res = await fetch(window.location.pathname, {
-      method: "POST",
-      body: fd,
-      headers: { Accept: "application/json" },
-    });
-
-    const contentType = res.headers.get("content-type") || "";
-    const text = await res.text();
-      console.error("Non-JSON response:", {
-        status: res.status,
-        contentType,
-        snippet: text.slice(0, 300),
-      });
-      setError(
-        `text ${text} (status ${res.status}). See console for HTML snippet.`
-      );
-      setRowLoading(null);
-      return;
-
-
-    let json;
-    try {
-      json = await res.json();
-    } catch (e) {
-      setError(e.message);
-      setRowLoading(null);
-      return;
-    }
-
-    if (!json.success) setError(json.message);
-
-    setRowLoading(null);
+    // ✅ dùng fetcher để tránh bị redirect sang login (HTML)
+    syncFetcher.submit(fd, { method: "POST" });
   };
 
+  const canSyncAll = useMemo(
+    () => Boolean(items.length) && !isSyncing,
+    [items.length, isSyncing]
+  );
+
+  // ✅ Giữ logic Sync All tuần tự + progress như code gốc
+  // Lưu ý: fetch tay có thể vẫn dính login redirect trong embedded app.
+  // Nếu muốn chắc chắn 100%: làm intent="syncAll" phía server (1 request).
   const syncAll = async () => {
     setError(null);
     setIsSyncing(true);
@@ -373,7 +369,23 @@ export default function ProductLinkPage() {
       const res = await fetch(window.location.pathname, {
         method: "POST",
         body: fd,
+        headers: { Accept: "application/json" },
       });
+
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        const text = await res.text();
+        console.error("Non-JSON response in syncAll:", {
+          status: res.status,
+          contentType,
+          snippet: text.slice(0, 300),
+        });
+        setError(
+          `Sync All failed: expected JSON but got ${contentType} (status ${res.status}). Likely redirected to login.`
+        );
+        setIsSyncing(false);
+        return;
+      }
 
       const json = await res.json();
 
@@ -392,7 +404,6 @@ export default function ProductLinkPage() {
   return (
     <Page title="Sync Product Link">
       <BlockStack gap="400">
-
         {error && (
           <Banner tone="critical" onDismiss={() => setError(null)}>
             {error}
@@ -401,7 +412,7 @@ export default function ProductLinkPage() {
 
         <Card>
           <InlineStack gap="200">
-            <Button onClick={handleFetch} loading={isFetching}>
+            <Button onClick={handleFetch} loading={isFetchingLinks}>
               Fetch Links
             </Button>
 
@@ -409,7 +420,7 @@ export default function ProductLinkPage() {
               variant="primary"
               onClick={syncAll}
               loading={isSyncing}
-              disabled={!items.length || isSyncing}
+              disabled={!canSyncAll}
             >
               Sync All
             </Button>
@@ -420,15 +431,13 @@ export default function ProductLinkPage() {
               <Text>
                 Syncing {progress.done} / {progress.total}
               </Text>
-              <ProgressBar
-                progress={(progress.done / progress.total) * 100}
-              />
+              <ProgressBar progress={(progress.done / progress.total) * 100} />
             </BlockStack>
           )}
         </Card>
 
         <Card padding="0">
-          {isFetching ? (
+          {isFetchingLinks ? (
             <div style={{ padding: 40, textAlign: "center" }}>
               <Spinner size="large" />
             </div>
@@ -450,12 +459,8 @@ export default function ProductLinkPage() {
                     key={item.parent_id}
                     position={index}
                   >
-                    <IndexTable.Cell>
-                      {item.parent_id}
-                    </IndexTable.Cell>
-                    <IndexTable.Cell>
-                      {item.shopify_id}
-                    </IndexTable.Cell>
+                    <IndexTable.Cell>{item.parent_id}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.shopify_id}</IndexTable.Cell>
                     <IndexTable.Cell>
                       <div style={{ whiteSpace: "normal", maxWidth: 300 }}>
                         <Text>{item.name}</Text>
@@ -466,6 +471,7 @@ export default function ProductLinkPage() {
                         size="slim"
                         loading={rowLoading === item.parent_id}
                         onClick={() => syncOne(item)}
+                        disabled={isSyncing}
                       >
                         Sync
                       </Button>
