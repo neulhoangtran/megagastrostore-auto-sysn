@@ -4,6 +4,7 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettingOr } from "../utils/settings";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import { authenticatedFetch } from "@shopify/app-bridge-utils";
 import {
   Page,
   Card,
@@ -81,7 +82,13 @@ export const loader = async ({ request }) => {
   return null;
 };
 
-async function syncLinksToMetafields({ admin, shopifyProductId, related, upsell, crosssell }) {
+async function syncLinksToMetafields({
+  admin,
+  shopifyProductId,
+  related,
+  upsell,
+  crosssell,
+}) {
   // --- helper: check product exists ---
   const existsProduct = async (id) => {
     if (!id) return false;
@@ -188,9 +195,7 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  if (!intent) {
-    return toJson({ success: false, message: "Missing intent" });
-  }
+  if (!intent) return toJson({ success: false, message: "Missing intent" });
 
   const MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
   if (!MAGENTO_BASE) {
@@ -277,7 +282,9 @@ export const action = async ({ request }) => {
   if (intent === "sync") {
     try {
       const shopifyProductId = formData.get("shopifyProductId");
-      if (!shopifyProductId) return toJson({ success: false, message: "Missing Shopify Product ID" });
+      if (!shopifyProductId) {
+        return toJson({ success: false, message: "Missing Shopify Product ID" });
+      }
 
       const related = JSON.parse(formData.get("related") || "[]");
       const upsell = JSON.parse(formData.get("upsell") || "[]");
@@ -296,55 +303,6 @@ export const action = async ({ request }) => {
       return toJson({ success: false, message: e?.message || String(e) });
     }
   }
-  if (intent === "syncAll") {
-    try {
-      const items = JSON.parse(formData.get("items") || "[]");
-      if (!Array.isArray(items) || items.length === 0) {
-        return toJson({ success: false, message: "Missing items" });
-      }
-
-      const results = [];
-      for (const item of items) {
-        const shopifyProductId = item.shopify_id;
-        const related = item.related || [];
-        const upsell = item.upsell || [];
-        const crosssell = item.crosssell || [];
-
-        const r = await syncLinksToMetafields({
-          admin,
-          shopifyProductId,
-          related,
-          upsell,
-          crosssell,
-        });
-
-        results.push({
-          parent_id: item.parent_id,
-          shopify_id: shopifyProductId,
-          ...r,
-        });
-
-        // nếu muốn: gặp stop thì dừng luôn
-        // if (r.stop) break;
-        // hoặc nếu muốn: gặp fail thì dừng luôn
-        // if (!r.success) break;
-      }
-
-      const okCount = results.filter((x) => x.success).length;
-      const failCount = results.length - okCount;
-
-      return toJson({
-        success: failCount === 0,
-        total: items.length,
-        processed: results.length,
-        ok: okCount,
-        failed: failCount,
-        results,
-      });
-    } catch (e) {
-      return toJson({ success: false, message: e?.message || String(e) });
-    }
-  }
 
   return toJson({ success: false, message: "Invalid intent" });
 };
@@ -359,7 +317,10 @@ export default function ProductLinkPage() {
   // ✅ tách 2 fetcher để tránh đụng state/data giữa fetch links và sync
   const fetchLinksFetcher = useFetcher();
   const syncFetcher = useFetcher();
+
   const shopify = useAppBridge();
+  const appFetch = useMemo(() => authenticatedFetch(shopify), [shopify]);
+
   const [items, setItems] = useState([]);
   const [isSyncing, setIsSyncing] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
@@ -372,42 +333,26 @@ export default function ProductLinkPage() {
   useEffect(() => {
     if (!fetchLinksFetcher.data) return;
 
-    if (fetchLinksFetcher.data?.items) setItems(fetchLinksFetcher.data.items);
-    if (fetchLinksFetcher.data?.success === false)
-      setError(fetchLinksFetcher.data.message);
-  }, [fetchLinksFetcher.data]);
+    if (fetchLinksFetcher.data?.items) {
+      setItems(fetchLinksFetcher.data.items);
+      shopify.toast.show(`Fetched ${fetchLinksFetcher.data.items.length} products`);
+    }
 
-  // apply sync result (syncOne)
-   useEffect(() => {
+    if (fetchLinksFetcher.data?.success === false) {
+      setError(fetchLinksFetcher.data.message);
+    }
+  }, [fetchLinksFetcher.data, shopify]);
+
+  // apply syncOne result (syncFetcher)
+  useEffect(() => {
     if (!syncFetcher.data) return;
-    // ❌ Fail
+
     if (syncFetcher.data.success === false) {
       setError(syncFetcher.data.message || "Sync failed");
-      setIsSyncing(false);
       setRowLoading(null);
       return;
     }
-    // ✅ syncAll response (có results[])
-    if (Array.isArray(syncFetcher.data.results)) {
-      const processed = syncFetcher.data.processed ?? syncFetcher.data.results.length ?? 0;
-      const total = syncFetcher.data.total ?? progress.total ?? items.length;
 
-      setProgress((p) => ({ ...p, done: processed, total }));
-      setIsSyncing(false);
-      setRowLoading(null);
-
-      const ok = syncFetcher.data.ok ?? syncFetcher.data.results.filter((x) => x.success).length;
-      const failed = syncFetcher.data.failed ?? (processed - ok);
-
-      if (failed > 0) {
-        shopify.toast.show(`Sync All done: ${ok}/${processed} success, ${failed} failed`);
-      } else {
-        shopify.toast.show(`Sync All done: ${ok}/${processed} success`);
-      }
-      return;
-    }
-
-    // ✅ syncOne response
     const { skipped, removed } = syncFetcher.data;
 
     if (skipped) {
@@ -420,7 +365,7 @@ export default function ProductLinkPage() {
     }
 
     setRowLoading(null);
-  }, [syncFetcher.data, shopify]); // progress/items không cần đưa vào dependency nếu chỉ dùng fallback nhẹ
+  }, [syncFetcher.data, shopify]);
 
   const handleFetch = () => {
     setError(null);
@@ -447,19 +392,68 @@ export default function ProductLinkPage() {
     [items.length, isSyncing]
   );
 
-  // ✅ Giữ logic Sync All tuần tự + progress như code gốc
-  // Lưu ý: fetch tay có thể vẫn dính login redirect trong embedded app.
-  // Nếu muốn chắc chắn 100%: làm intent="syncAll" phía server (1 request).
-  const syncAll = () => {
+  // ✅ Sync All: tuần tự từng sản phẩm để progress nhảy + dùng authenticatedFetch để không bị login HTML
+  const syncAll = async () => {
     setError(null);
     setIsSyncing(true);
     setProgress({ done: 0, total: items.length });
 
-    const fd = new FormData();
-    fd.append("intent", "syncAll");
-    fd.append("items", JSON.stringify(items));
+    let ok = 0;
+    let skipped = 0;
 
-    syncFetcher.submit(fd, { method: "POST" });
+    for (const item of items) {
+      const fd = new FormData();
+      fd.append("intent", "sync");
+      fd.append("shopifyProductId", item.shopify_id);
+      fd.append("related", JSON.stringify(item.related));
+      fd.append("upsell", JSON.stringify(item.upsell));
+      fd.append("crosssell", JSON.stringify(item.crosssell));
+
+      const res = await appFetch(window.location.pathname, {
+        method: "POST",
+        body: fd,
+        headers: { Accept: "application/json" },
+      });
+
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        const text = await res.text();
+        console.error("Non-JSON response in syncAll:", {
+          status: res.status,
+          contentType,
+          snippet: text.slice(0, 300),
+        });
+        setError(
+          `Sync All failed: expected JSON but got ${contentType} (status ${res.status}).`
+        );
+        setIsSyncing(false);
+        return;
+      }
+
+      const json = await res.json();
+
+      if (!json.success) {
+        setError(json.message || "Sync failed");
+        setIsSyncing(false);
+        return;
+      }
+
+      if (json.skipped) skipped += 1;
+      else ok += 1;
+
+      setProgress((p) => ({ ...p, done: p.done + 1 }));
+
+      // (optional) giảm throttle
+      // await new Promise((r) => setTimeout(r, 80));
+    }
+
+    setIsSyncing(false);
+
+    if (skipped > 0) {
+      shopify.toast.show(`Sync All done: ${ok} synced, ${skipped} skipped`);
+    } else {
+      shopify.toast.show(`Sync All done: ${ok} synced`);
+    }
   };
 
   return (
