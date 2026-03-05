@@ -1,10 +1,9 @@
 import { useFetcher } from "react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettingOr } from "../utils/settings";
 import { useAppBridge } from "@shopify/app-bridge-react";
-import { authenticatedFetch } from "@shopify/app-bridge-utils";
 import {
   Page,
   Card,
@@ -276,7 +275,7 @@ export const action = async ({ request }) => {
 
   /*
   ======================
-  SYNC
+  SYNC (single)
   ======================
   */
   if (intent === "sync") {
@@ -290,6 +289,8 @@ export const action = async ({ request }) => {
       const upsell = JSON.parse(formData.get("upsell") || "[]");
       const crosssell = JSON.parse(formData.get("crosssell") || "[]");
 
+      const requestId = formData.get("requestId") || null;
+
       const result = await syncLinksToMetafields({
         admin,
         shopifyProductId,
@@ -298,7 +299,7 @@ export const action = async ({ request }) => {
         crosssell,
       });
 
-      return toJson(result);
+      return toJson({ ...result, requestId });
     } catch (e) {
       return toJson({ success: false, message: e?.message || String(e) });
     }
@@ -314,12 +315,9 @@ CLIENT
 */
 
 export default function ProductLinkPage() {
-  // ✅ tách 2 fetcher để tránh đụng state/data giữa fetch links và sync
   const fetchLinksFetcher = useFetcher();
   const syncFetcher = useFetcher();
-
   const shopify = useAppBridge();
-  const appFetch = useMemo(() => authenticatedFetch(shopify), [shopify]);
 
   const [items, setItems] = useState([]);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -329,23 +327,41 @@ export default function ProductLinkPage() {
 
   const isFetchingLinks = fetchLinksFetcher.state !== "idle";
 
+  // ---- refs to read latest fetcher state/data inside await loop ----
+  const syncStateRef = useRef(syncFetcher.state);
+  const syncDataRef = useRef(syncFetcher.data);
+
+  useEffect(() => {
+    syncStateRef.current = syncFetcher.state;
+  }, [syncFetcher.state]);
+
+  useEffect(() => {
+    syncDataRef.current = syncFetcher.data;
+  }, [syncFetcher.data]);
+
   // apply fetch links result
   useEffect(() => {
     if (!fetchLinksFetcher.data) return;
+
+    if (fetchLinksFetcher.data?.success === false) {
+      setError(fetchLinksFetcher.data.message);
+      return;
+    }
 
     if (fetchLinksFetcher.data?.items) {
       setItems(fetchLinksFetcher.data.items);
       shopify.toast.show(`Fetched ${fetchLinksFetcher.data.items.length} products`);
     }
-
-    if (fetchLinksFetcher.data?.success === false) {
-      setError(fetchLinksFetcher.data.message);
-    }
   }, [fetchLinksFetcher.data, shopify]);
 
-  // apply syncOne result (syncFetcher)
+  // show toast for syncOne (manual click)
+  // (syncAll will handle its own summary toast to avoid spam)
+  const syncModeRef = useRef("idle"); // "idle" | "one" | "all"
   useEffect(() => {
     if (!syncFetcher.data) return;
+
+    // only toast per-item when user clicked Sync (not Sync All)
+    if (syncModeRef.current !== "one") return;
 
     if (syncFetcher.data.success === false) {
       setError(syncFetcher.data.message || "Sync failed");
@@ -365,6 +381,7 @@ export default function ProductLinkPage() {
     }
 
     setRowLoading(null);
+    syncModeRef.current = "idle";
   }, [syncFetcher.data, shopify]);
 
   const handleFetch = () => {
@@ -375,6 +392,7 @@ export default function ProductLinkPage() {
   const syncOne = (item) => {
     setError(null);
     setRowLoading(item.parent_id);
+    syncModeRef.current = "one";
 
     const fd = new FormData();
     fd.append("intent", "sync");
@@ -392,67 +410,91 @@ export default function ProductLinkPage() {
     [items.length, isSyncing]
   );
 
-  // ✅ Sync All: tuần tự từng sản phẩm để progress nhảy + dùng authenticatedFetch để không bị login HTML
+  // Helper: submit 1 sync request and await its completion (no appFetch)
+  const submitSyncAndWait = async (fd, requestId) => {
+    fd.append("requestId", requestId);
+
+    // fire
+    syncFetcher.submit(fd, { method: "POST" });
+
+    // wait until fetcher back to idle AND response matches requestId
+    const startedAt = Date.now();
+    const TIMEOUT_MS = 120000; // 2 minutes per item safety
+
+    while (true) {
+      // timeout guard
+      if (Date.now() - startedAt > TIMEOUT_MS) {
+        throw new Error("Timeout waiting for sync response");
+      }
+
+      // finish condition
+      if (
+        syncStateRef.current === "idle" &&
+        syncDataRef.current &&
+        String(syncDataRef.current.requestId || "") === String(requestId)
+      ) {
+        return syncDataRef.current;
+      }
+
+      // small sleep
+      await new Promise((r) => setTimeout(r, 40));
+    }
+  };
+
+  // ✅ Sync All: chạy từng item bằng syncFetcher, progress nhảy từng item
   const syncAll = async () => {
     setError(null);
     setIsSyncing(true);
     setProgress({ done: 0, total: items.length });
+    syncModeRef.current = "all";
 
     let ok = 0;
-    let skipped = 0;
+    let skippedCount = 0;
 
-    for (const item of items) {
-      const fd = new FormData();
-      fd.append("intent", "sync");
-      fd.append("shopifyProductId", item.shopify_id);
-      fd.append("related", JSON.stringify(item.related));
-      fd.append("upsell", JSON.stringify(item.upsell));
-      fd.append("crosssell", JSON.stringify(item.crosssell));
+    try {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        setRowLoading(item.parent_id);
 
-      const res = await appFetch(window.location.pathname, {
-        method: "POST",
-        body: fd,
-        headers: { Accept: "application/json" },
-      });
+        const fd = new FormData();
+        fd.append("intent", "sync");
+        fd.append("shopifyProductId", item.shopify_id);
+        fd.append("related", JSON.stringify(item.related));
+        fd.append("upsell", JSON.stringify(item.upsell));
+        fd.append("crosssell", JSON.stringify(item.crosssell));
 
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error("Non-JSON response in syncAll:", {
-          status: res.status,
-          contentType,
-          snippet: text.slice(0, 300),
-        });
-        setError(
-          `Sync All failed: expected JSON but got ${contentType} (status ${res.status}).`
-        );
-        setIsSyncing(false);
-        return;
+        const requestId = `${Date.now()}-${i}-${item.parent_id}`;
+
+        const result = await submitSyncAndWait(fd, requestId);
+
+        if (!result?.success) {
+          setError(result?.message || "Sync failed");
+          setIsSyncing(false);
+          setRowLoading(null);
+          syncModeRef.current = "idle";
+          return;
+        }
+
+        if (result.skipped) skippedCount += 1;
+        else ok += 1;
+
+        setProgress((p) => ({ ...p, done: p.done + 1 }));
       }
 
-      const json = await res.json();
+      setIsSyncing(false);
+      setRowLoading(null);
+      syncModeRef.current = "idle";
 
-      if (!json.success) {
-        setError(json.message || "Sync failed");
-        setIsSyncing(false);
-        return;
+      if (skippedCount > 0) {
+        shopify.toast.show(`Sync All done: ${ok} synced, ${skippedCount} skipped`);
+      } else {
+        shopify.toast.show(`Sync All done: ${ok} synced`);
       }
-
-      if (json.skipped) skipped += 1;
-      else ok += 1;
-
-      setProgress((p) => ({ ...p, done: p.done + 1 }));
-
-      // (optional) giảm throttle
-      // await new Promise((r) => setTimeout(r, 80));
-    }
-
-    setIsSyncing(false);
-
-    if (skipped > 0) {
-      shopify.toast.show(`Sync All done: ${ok} synced, ${skipped} skipped`);
-    } else {
-      shopify.toast.show(`Sync All done: ${ok} synced`);
+    } catch (e) {
+      setError(e?.message || String(e));
+      setIsSyncing(false);
+      setRowLoading(null);
+      syncModeRef.current = "idle";
     }
   };
 
