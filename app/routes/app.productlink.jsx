@@ -325,9 +325,9 @@ export const action = async ({ request }) => {
         });
 
         // nếu muốn: gặp stop thì dừng luôn
-        if (r.stop) break;
+        // if (r.stop) break;
         // hoặc nếu muốn: gặp fail thì dừng luôn
-        if (!r.success) break;
+        // if (!r.success) break;
       }
 
       const okCount = results.filter((x) => x.success).length;
