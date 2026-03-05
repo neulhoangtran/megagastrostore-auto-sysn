@@ -81,6 +81,108 @@ export const loader = async ({ request }) => {
   return null;
 };
 
+async function syncLinksToMetafields({ admin, shopifyProductId, related, upsell, crosssell }) {
+  // --- helper: check product exists ---
+  const existsProduct = async (id) => {
+    if (!id) return false;
+    const res = await admin.graphql(
+      `#graphql
+      query($id: ID!) {
+        product(id: $id) { id }
+      }`,
+      { variables: { id } }
+    );
+    const json = await res.json();
+    return Boolean(json?.data?.product?.id);
+  };
+
+  // ✅ 1) Check sản phẩm chính: không có -> STOP
+  const ownerOk = await existsProduct(shopifyProductId);
+  if (!ownerOk) {
+    return {
+      success: false,
+      message: `Owner product does not exist: ${shopifyProductId}`,
+      stop: true,
+    };
+  }
+
+  // ✅ 2) Check sản phẩm con: cái nào không có -> remove
+  const filterExisting = async (ids) => {
+    const out = [];
+    for (const id of Array.isArray(ids) ? ids : []) {
+      if (await existsProduct(id)) out.push(id);
+    }
+    return out;
+  };
+
+  const relatedOk = await filterExisting(related);
+  const upsellOk = await filterExisting(upsell);
+  const crosssellOk = await filterExisting(crosssell);
+
+  // ✅ 3) Nếu tất cả con rỗng -> bỏ qua sync (không set metafield)
+  const totalChildren = relatedOk.length + upsellOk.length + crosssellOk.length;
+  if (totalChildren === 0) {
+    return {
+      success: true,
+      skipped: true,
+      message: "All linked products missing. Skip metafieldsSet.",
+      removed: {
+        related: related.length,
+        upsell: upsell.length,
+        crosssell: crosssell.length,
+      },
+    };
+  }
+
+  // ✅ 4) ensure definition
+  await ensureDefinition(admin, "related");
+  await ensureDefinition(admin, "upsell");
+  await ensureDefinition(admin, "crosssell");
+
+  // ✅ 5) Build metafields (chỉ build list còn tồn tại)
+  const metafields = [];
+  const build = (key, list) => {
+    if (!list.length) return;
+    metafields.push({
+      ownerId: shopifyProductId,
+      namespace: "magento",
+      key,
+      type: "list.product_reference",
+      value: JSON.stringify(list),
+    });
+  };
+
+  build("related", relatedOk);
+  build("upsell", upsellOk);
+  build("crosssell", crosssellOk);
+
+  const res = await admin.graphql(
+    `#graphql
+    mutation Set($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }`,
+    { variables: { metafields } }
+  );
+
+  const json = await res.json();
+  const errs = json?.data?.metafieldsSet?.userErrors ?? [];
+  if (errs.length) {
+    return { success: false, message: errs[0].message };
+  }
+
+  return {
+    success: true,
+    skipped: false,
+    removed: {
+      related: related.length - relatedOk.length,
+      upsell: upsell.length - upsellOk.length,
+      crosssell: crosssell.length - crosssellOk.length,
+    },
+  };
+}
+
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
@@ -175,110 +277,69 @@ export const action = async ({ request }) => {
   if (intent === "sync") {
     try {
       const shopifyProductId = formData.get("shopifyProductId");
-      if (!shopifyProductId) {
-        return toJson({ success: false, message: "Missing Shopify Product ID" });
-      }
+      if (!shopifyProductId) return toJson({ success: false, message: "Missing Shopify Product ID" });
 
       const related = JSON.parse(formData.get("related") || "[]");
       const upsell = JSON.parse(formData.get("upsell") || "[]");
       const crosssell = JSON.parse(formData.get("crosssell") || "[]");
 
-      // --- helper: check product exists ---
-      const existsProduct = async (id) => {
-        if (!id) return false;
-        const res = await admin.graphql(
-          `#graphql
-          query($id: ID!) {
-            product(id: $id) { id }
-          }`,
-          { variables: { id } }
-        );
-        const json = await res.json();
-        return Boolean(json?.data?.product?.id);
-      };
+      const result = await syncLinksToMetafields({
+        admin,
+        shopifyProductId,
+        related,
+        upsell,
+        crosssell,
+      });
 
-      // ✅ 1) Check sản phẩm chính: không có -> STOP
-      const ownerOk = await existsProduct(shopifyProductId);
-      if (!ownerOk) {
-        return toJson({
-          success: false,
-          message: `Owner product does not exist: ${shopifyProductId}`,
-          stop: true,
-        });
+      return toJson(result);
+    } catch (e) {
+      return toJson({ success: false, message: e?.message || String(e) });
+    }
+  }
+  if (intent === "syncAll") {
+    try {
+      const items = JSON.parse(formData.get("items") || "[]");
+      if (!Array.isArray(items) || items.length === 0) {
+        return toJson({ success: false, message: "Missing items" });
       }
 
-      // ✅ 2) Check sản phẩm con: cái nào không có -> remove
-      // (chạy tuần tự để đơn giản; nếu list lớn mình sẽ tối ưu batch sau)
-      const filterExisting = async (ids) => {
-        const out = [];
-        for (const id of Array.isArray(ids) ? ids : []) {
-          if (await existsProduct(id)) out.push(id);
-        }
-        return out;
-      };
+      const results = [];
+      for (const item of items) {
+        const shopifyProductId = item.shopify_id;
+        const related = item.related || [];
+        const upsell = item.upsell || [];
+        const crosssell = item.crosssell || [];
 
-      const relatedOk = await filterExisting(related);
-      const upsellOk = await filterExisting(upsell);
-      const crosssellOk = await filterExisting(crosssell);
-
-      // ✅ 3) Nếu tất cả con rỗng -> bỏ qua sync (không set metafield)
-      const totalChildren =
-        relatedOk.length + upsellOk.length + crosssellOk.length;
-
-      if (totalChildren === 0) {
-        return toJson({
-          success: true,
-          skipped: true,
-          message: "All linked products missing. Skip metafieldsSet.",
+        const r = await syncLinksToMetafields({
+          admin,
+          shopifyProductId,
+          related,
+          upsell,
+          crosssell,
         });
+
+        results.push({
+          parent_id: item.parent_id,
+          shopify_id: shopifyProductId,
+          ...r,
+        });
+
+        // nếu muốn: gặp stop thì dừng luôn
+        if (r.stop) break;
+        // hoặc nếu muốn: gặp fail thì dừng luôn
+        if (!r.success) break;
       }
 
-      // ✅ 4) ensure definition
-      await ensureDefinition(admin, "related");
-      await ensureDefinition(admin, "upsell");
-      await ensureDefinition(admin, "crosssell");
-
-      // ✅ 5) Build metafields (chỉ build list còn tồn tại)
-      const metafields = [];
-      const build = (key, list) => {
-        if (!list.length) return;
-        metafields.push({
-          ownerId: shopifyProductId,
-          namespace: "magento",
-          key,
-          type: "list.product_reference",
-          value: JSON.stringify(list),
-        });
-      };
-
-      build("related", relatedOk);
-      build("upsell", upsellOk);
-      build("crosssell", crosssellOk);
-
-      const res = await admin.graphql(
-        `#graphql
-        mutation Set($metafields: [MetafieldsSetInput!]!) {
-          metafieldsSet(metafields: $metafields) {
-            userErrors { field message }
-          }
-        }`,
-        { variables: { metafields } }
-      );
-
-      const json = await res.json();
-      const errs = json?.data?.metafieldsSet?.userErrors ?? [];
-      if (errs.length) {
-        return toJson({ success: false, message: errs[0].message });
-      }
+      const okCount = results.filter((x) => x.success).length;
+      const failCount = results.length - okCount;
 
       return toJson({
-        success: true,
-        skipped: false,
-        removed: {
-          related: related.length - relatedOk.length,
-          upsell: upsell.length - upsellOk.length,
-          crosssell: crosssell.length - crosssellOk.length,
-        },
+        success: failCount === 0,
+        total: items.length,
+        processed: results.length,
+        ok: okCount,
+        failed: failCount,
+        results,
       });
     } catch (e) {
       return toJson({ success: false, message: e?.message || String(e) });
@@ -317,29 +378,49 @@ export default function ProductLinkPage() {
   }, [fetchLinksFetcher.data]);
 
   // apply sync result (syncOne)
-    useEffect(() => {
-      if (!syncFetcher.data) return;
-
-      if (syncFetcher.data.success === false) {
-        setError(syncFetcher.data.message);
-      } else {
-        // ✅ toast khi sync thành công
-        const { skipped, removed } = syncFetcher.data;
-
-        if (skipped) {
-          shopify.toast.show("Skipped: all linked products missing");
-        } else {
-          const msg =
-            removed
-              ? `Product synced (removed: r${removed.related}, u${removed.upsell}, c${removed.crosssell})`
-              : "Product synced";
-
-          shopify.toast.show(msg);
-        }
-      }
-
+   useEffect(() => {
+    if (!syncFetcher.data) return;
+    // ❌ Fail
+    if (syncFetcher.data.success === false) {
+      setError(syncFetcher.data.message || "Sync failed");
+      setIsSyncing(false);
       setRowLoading(null);
-    }, [syncFetcher.data, shopify]);
+      return;
+    }
+    // ✅ syncAll response (có results[])
+    if (Array.isArray(syncFetcher.data.results)) {
+      const processed = syncFetcher.data.processed ?? syncFetcher.data.results.length ?? 0;
+      const total = syncFetcher.data.total ?? progress.total ?? items.length;
+
+      setProgress((p) => ({ ...p, done: processed, total }));
+      setIsSyncing(false);
+      setRowLoading(null);
+
+      const ok = syncFetcher.data.ok ?? syncFetcher.data.results.filter((x) => x.success).length;
+      const failed = syncFetcher.data.failed ?? (processed - ok);
+
+      if (failed > 0) {
+        shopify.toast.show(`Sync All done: ${ok}/${processed} success, ${failed} failed`);
+      } else {
+        shopify.toast.show(`Sync All done: ${ok}/${processed} success`);
+      }
+      return;
+    }
+
+    // ✅ syncOne response
+    const { skipped, removed } = syncFetcher.data;
+
+    if (skipped) {
+      shopify.toast.show("Skipped: all linked products missing");
+    } else {
+      const msg = removed
+        ? `Product synced (removed: r${removed.related}, u${removed.upsell}, c${removed.crosssell})`
+        : "Product synced";
+      shopify.toast.show(msg);
+    }
+
+    setRowLoading(null);
+  }, [syncFetcher.data, shopify]); // progress/items không cần đưa vào dependency nếu chỉ dùng fallback nhẹ
 
   const handleFetch = () => {
     setError(null);
@@ -369,52 +450,16 @@ export default function ProductLinkPage() {
   // ✅ Giữ logic Sync All tuần tự + progress như code gốc
   // Lưu ý: fetch tay có thể vẫn dính login redirect trong embedded app.
   // Nếu muốn chắc chắn 100%: làm intent="syncAll" phía server (1 request).
-  const syncAll = async () => {
+  const syncAll = () => {
     setError(null);
     setIsSyncing(true);
     setProgress({ done: 0, total: items.length });
 
-    for (const item of items) {
-      const fd = new FormData();
-      fd.append("intent", "sync");
-      fd.append("shopifyProductId", item.shopify_id);
-      fd.append("related", JSON.stringify(item.related));
-      fd.append("upsell", JSON.stringify(item.upsell));
-      fd.append("crosssell", JSON.stringify(item.crosssell));
+    const fd = new FormData();
+    fd.append("intent", "syncAll");
+    fd.append("items", JSON.stringify(items));
 
-      const res = await fetch(window.location.pathname, {
-        method: "POST",
-        body: fd,
-        headers: { Accept: "application/json" },
-      });
-
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error("Non-JSON response in syncAll:", {
-          status: res.status,
-          contentType,
-          snippet: text.slice(0, 300),
-        });
-        setError(
-          `Sync All failed: expected JSON but got ${contentType} (status ${res.status}). Likely redirected to login.`
-        );
-        setIsSyncing(false);
-        return;
-      }
-
-      const json = await res.json();
-
-      if (!json.success) {
-        setError(json.message);
-        setIsSyncing(false);
-        return;
-      }
-
-      setProgress((p) => ({ ...p, done: p.done + 1 }));
-    }
-
-    setIsSyncing(false);
+    syncFetcher.submit(fd, { method: "POST" });
   };
 
   return (
