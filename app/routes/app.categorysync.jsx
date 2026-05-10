@@ -64,16 +64,18 @@ function buildCollectionRedirectTo(handle) {
 
 function escapeCsvCell(value) {
   const text = asString(value);
+  const doubleQuote = String.fromCharCode(34);
+  const lineFeed = String.fromCharCode(10);
+  const carriageReturn = String.fromCharCode(13);
+
   const mustQuote =
-    text.includes('"') ||
+    text.includes(doubleQuote) ||
     text.includes(",") ||
-    text.includes("
-") ||
-    text.includes("
-");
+    text.includes(lineFeed) ||
+    text.includes(carriageReturn);
 
   if (mustQuote) {
-    return `"${text.replaceAll('"', '""')}"`;
+    return doubleQuote + text.split(doubleQuote).join(doubleQuote + doubleQuote) + doubleQuote;
   }
 
   return text;
