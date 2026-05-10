@@ -28,26 +28,6 @@ function chunk(arr, size = 250) {
   return out;
 }
 
-async function addProductsToCollection(admin, { collectionId, productIds }) {
-  const res = await admin.graphql(
-    `#graphql
-    mutation AddProducts($id: ID!, $productIds: [ID!]!) {
-      collectionAddProductsV2(id: $id, productIds: $productIds) {
-        job { id done }
-        userErrors { field message }
-      }
-    }`,
-    { variables: { id: collectionId, productIds } }
-  );
-
-  const json = await res.json();
-  const payload = json?.data?.collectionAddProductsV2;
-  const errs = payload?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-
-  return payload?.job ?? null;
-}
-
 function asInt(value, fallback = null) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -67,7 +47,7 @@ function normalizePath(value) {
       return new URL(raw).pathname;
     }
   } catch {
-    // keep raw path below
+    // Keep raw path below.
   }
 
   return raw.startsWith("/") ? raw : `/${raw}`;
@@ -84,44 +64,73 @@ function buildCollectionRedirectTo(handle) {
 
 function escapeCsvCell(value) {
   const text = asString(value);
-  if (/[",
+  const mustQuote =
+    text.includes('"') ||
+    text.includes(",") ||
+    text.includes("
+") ||
+    text.includes("
+");
 
-]/.test(text)) {
-    return `"${text.replace(/"/g, '""')}"`;
+  if (mustQuote) {
+    return `"${text.replaceAll('"', '""')}"`;
   }
+
   return text;
 }
 
 function downloadRedirectCsv(items) {
+  if (typeof window === "undefined") return;
+
   const rows = items
     .filter((item) => item.redirectFrom && item.redirectTo)
     .map((item) => [item.redirectFrom, item.redirectTo]);
 
-  const csv = [
-    ["Redirect from", "Redirect to"],
-    ...rows,
-  ]
+  const csv = [["Redirect from", "Redirect to"], ...rows]
     .map((row) => row.map(escapeCsvCell).join(","))
     .join("
 ");
 
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
+  const url = window.URL.createObjectURL(blob);
   const link = document.createElement("a");
+
   link.href = url;
   link.download = "shopify-category-redirects.csv";
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
-  URL.revokeObjectURL(url);
+  window.URL.revokeObjectURL(url);
 }
 
 // Magento image helpers
 const MAGENTO_BASE_URL = "https://megagas.site";
+
 function buildMagentoImageUrl(imagePath) {
   if (!imagePath) return null;
   if (imagePath.startsWith("http")) return imagePath;
   return `${MAGENTO_BASE_URL}${imagePath}`;
+}
+
+async function addProductsToCollection(admin, { collectionId, productIds }) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation AddProducts($id: ID!, $productIds: [ID!]!) {
+      collectionAddProductsV2(id: $id, productIds: $productIds) {
+        job { id done }
+        userErrors { field message }
+      }
+    }`,
+    { variables: { id: collectionId, productIds } }
+  );
+
+  const json = await res.json();
+  const payload = json?.data?.collectionAddProductsV2;
+  const errs = payload?.userErrors ?? [];
+
+  if (errs.length) throw new Error(errs[0].message);
+
+  return payload?.job ?? null;
 }
 
 async function getShopifyCollectionHandles(admin, collectionIds) {
@@ -157,7 +166,7 @@ async function getShopifyCollectionHandles(admin, collectionIds) {
 
 /**
  * ======================
- * SHOPIFY PUBLISH HELPERS
+ * SHOPIFY HELPERS
  * ======================
  */
 
@@ -275,8 +284,8 @@ export const action = async ({ request }) => {
     "resync",
     "sync_products",
     "sync_category_redirects",
-    "push_shopify_category_redirects",
   ]);
+
   let MAGENTO_BASE = null;
 
   if (intentsNeedMagento.has(intent)) {
@@ -292,10 +301,47 @@ export const action = async ({ request }) => {
   }
 
   /**
-   * SYNC CATEGORY REDIRECT PATHS
-   * Lấy url_path từ Magento và handle từ Shopify collection, sau đó lưu:
-   * redirectFrom = /magento/category/path
-   * redirectTo   = /collections/shopify-handle
+   * FETCH MAGENTO CATEGORIES
+   */
+  if (intent === "fetch") {
+    const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/categories`);
+
+    if (!res.ok) {
+      throw new Response("Failed to fetch Magento categories", { status: 500 });
+    }
+
+    const magentoData = await res.json();
+    const mapped = await prisma.collectionMapCategory.findMany();
+
+    const mappedByMagentoId = new Map(
+      mapped.map((m) => [m.magentoCategoryId, m])
+    );
+
+    const items = (magentoData?.items ?? []).map((cat) => {
+      const map = mappedByMagentoId.get(Number(cat.category_id));
+
+      return {
+        magentoCategoryId: cat.category_id,
+        name: cat.name,
+        shopifyCollectionId: map?.collectionId ?? null,
+        isSynced: Boolean(map),
+
+        redirectFrom: map?.redirectFrom ?? buildCollectionRedirectFrom(cat.url_path),
+        redirectTo: map?.redirectTo ?? "",
+
+        image: cat.image,
+        urlPath: cat.url_path,
+        metaTitle: cat.meta_title,
+        metaDescription: cat.meta_description,
+        description: cat.description,
+      };
+    });
+
+    return { items };
+  }
+
+  /**
+   * SYNC CATEGORY REDIRECT PATHS TO DATABASE
    */
   if (intent === "sync_category_redirects") {
     const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/categories`);
@@ -353,9 +399,7 @@ export const action = async ({ request }) => {
   }
 
   /**
-   * PUSH CATEGORY REDIRECTS TO SHOPIFY
-   * Tạo URL redirects trong Shopify từ dữ liệu đã lưu ở DB:
-   * redirectFrom -> redirectTo
+   * PUSH CATEGORY REDIRECTS TO SHOPIFY URL REDIRECTS
    */
   if (intent === "push_shopify_category_redirects") {
     const rows = await prisma.collectionMapCategory.findMany({
@@ -416,14 +460,19 @@ export const action = async ({ request }) => {
       throw new Response("Missing magentoCategoryId/collectionId", { status: 400 });
     }
 
-    // 1) lấy mapping category -> product_ids_json từ API
     const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/category-products`);
-    if (!res.ok) throw new Response("Failed to fetch category-products", { status: 500 });
+
+    if (!res.ok) {
+      throw new Response("Failed to fetch category-products", { status: 500 });
+    }
 
     const data = await res.json();
     const items = data?.items ?? [];
 
-    const row = items.find((x) => Number(x.category_id) === Number(magentoCategoryId));
+    const row = items.find(
+      (x) => Number(x.category_id) === Number(magentoCategoryId)
+    );
+
     if (!row) {
       return { success: true, added: 0, reason: "No products in this category" };
     }
@@ -441,7 +490,6 @@ export const action = async ({ request }) => {
       return { success: true, added: 0, reason: "Empty product list" };
     }
 
-    // 2) chỉ lấy những product đã sync sang shopify (có shopifyProductId)
     const mappedProducts = await prisma.productMapMagento.findMany({
       where: { magentoProductId: { in: magentoProductIds } },
       select: { magentoProductId: true, shopifyProductId: true },
@@ -455,11 +503,15 @@ export const action = async ({ request }) => {
       return { success: true, added: 0, reason: "No synced products yet" };
     }
 
-    // 3) add products vào collection (chunk 250 để an toàn)
     const chunks = chunk(shopifyProductIds, 250);
     const jobs = [];
+
     for (const ids of chunks) {
-      const job = await addProductsToCollection(admin, { collectionId, productIds: ids });
+      const job = await addProductsToCollection(admin, {
+        collectionId,
+        productIds: ids,
+      });
+
       if (job?.id) jobs.push(job);
     }
 
@@ -473,47 +525,7 @@ export const action = async ({ request }) => {
   }
 
   /**
-   * FETCH MAGENTO CATEGORIES
-   */
-  if (intent === "fetch") {
-    const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/categories`);
-
-    if (!res.ok) {
-      throw new Response("Failed to fetch Magento categories", { status: 500 });
-    }
-
-    const magentoData = await res.json();
-    const mapped = await prisma.collectionMapCategory.findMany();
-
-    const mappedByMagentoId = new Map(
-      mapped.map((m) => [m.magentoCategoryId, m])
-    );
-
-    const items = magentoData.items.map((cat) => {
-      const map = mappedByMagentoId.get(cat.category_id);
-
-      return {
-        magentoCategoryId: cat.category_id,
-        name: cat.name,
-        shopifyCollectionId: map?.collectionId ?? null,
-        isSynced: Boolean(map),
-
-        redirectFrom: map?.redirectFrom ?? buildCollectionRedirectFrom(cat.url_path),
-        redirectTo: map?.redirectTo ?? "",
-
-        image: cat.image,
-        urlPath: cat.url_path,
-        metaTitle: cat.meta_title,
-        metaDescription: cat.meta_description,
-        description: cat.description,
-      };
-    });
-
-    return { items };
-  }
-
-  /**
-   * SYNC / RESYNC
+   * SYNC / RESYNC CATEGORY
    */
   if (intent === "sync" || intent === "resync") {
     const magentoCategoryId = asInt(formData.get("magentoCategoryId"));
@@ -543,9 +555,6 @@ export const action = async ({ request }) => {
       ...(imageSrc ? { image: { src: imageSrc } } : {}),
     };
 
-    /**
-     * CREATE
-     */
     if (intent === "sync") {
       const res = await admin.graphql(
         `#graphql
@@ -569,7 +578,6 @@ export const action = async ({ request }) => {
       const collectionHandle = payload.collection.handle;
       const redirectTo = redirectToFromForm || buildCollectionRedirectTo(collectionHandle);
 
-      // PUBLISH COLLECTION
       await publishCollection(admin, collectionId);
 
       await prisma.collectionMapCategory.create({
@@ -585,10 +593,8 @@ export const action = async ({ request }) => {
       return { success: true };
     }
 
-    /**
-     * UPDATE
-     */
     const collectionId = asString(formData.get("collectionId"));
+
     if (!collectionId) {
       throw new Response("Missing collectionId", { status: 400 });
     }
@@ -618,7 +624,6 @@ export const action = async ({ request }) => {
     const collectionHandle = payload.collection?.handle;
     const redirectTo = redirectToFromForm || buildCollectionRedirectTo(collectionHandle);
 
-    // ENSURE PUBLISHED
     await publishCollection(admin, collectionId);
 
     await prisma.collectionMapCategory.update({
@@ -646,12 +651,10 @@ function RowActions({ item, onDone, disabled, shopify }) {
   const syncFetcher = useFetcher();
   const resyncFetcher = useFetcher();
   const syncProductsFetcher = useFetcher();
-  const syncing =
-    syncFetcher.state === "loading" ||
-    syncFetcher.state === "submitting";
+
+  const syncing = syncFetcher.state === "loading" || syncFetcher.state === "submitting";
   const resyncing =
-    resyncFetcher.state === "loading" ||
-    resyncFetcher.state === "submitting";
+    resyncFetcher.state === "loading" || resyncFetcher.state === "submitting";
   const syncingProducts = syncProductsFetcher.state !== "idle";
 
   useEffect(() => {
@@ -758,6 +761,7 @@ export default function CategorySyncPage() {
   const items = fetcher.data?.items ?? [];
   const unsyncedItems = items.filter((i) => !i.isSynced);
   const allSynced = unsyncedItems.length === 0;
+
   const syncingRedirects = syncRedirectsFetcher.state !== "idle";
   const pushingRedirects = pushRedirectsFetcher.state !== "idle";
 
@@ -807,9 +811,7 @@ export default function CategorySyncPage() {
   };
 
   const syncAllProducts = async () => {
-    const syncedCategories = items.filter(
-      (i) => i.isSynced && i.shopifyCollectionId
-    );
+    const syncedCategories = items.filter((i) => i.isSynced && i.shopifyCollectionId);
 
     if (syncedCategories.length === 0) return;
 
@@ -951,9 +953,7 @@ export default function CategorySyncPage() {
                   Syncing products {productProgress.done} / {productProgress.total}
                 </Text>
                 <ProgressBar
-                  progress={
-                    (productProgress.done / productProgress.total) * 100
-                  }
+                  progress={(productProgress.done / productProgress.total) * 100}
                 />
               </BlockStack>
             )}
@@ -982,9 +982,7 @@ export default function CategorySyncPage() {
                     key={item.magentoCategoryId}
                     position={index}
                   >
-                    <IndexTable.Cell>
-                      {item.shopifyCollectionId || "-"}
-                    </IndexTable.Cell>
+                    <IndexTable.Cell>{item.shopifyCollectionId || "-"}</IndexTable.Cell>
                     <IndexTable.Cell>{item.magentoCategoryId}</IndexTable.Cell>
                     <IndexTable.Cell>{item.name}</IndexTable.Cell>
                     <IndexTable.Cell>{item.redirectFrom || "-"}</IndexTable.Cell>
