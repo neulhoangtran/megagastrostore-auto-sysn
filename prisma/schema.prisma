@@ -63,6 +63,8 @@ model ProductMapMagento {
   magentoProductId Int      @unique
   sku              String?
   name             String
+  redirectFrom     String?
+  redirectTo       String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 

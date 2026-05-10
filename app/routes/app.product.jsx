@@ -1,6 +1,5 @@
 // app/routes/app.product.jsx
-import { Pagination, TextField, Banner   } from "@shopify/polaris";
-import he from "he";
+import { Pagination, TextField } from "@shopify/polaris";
 import { useFetcher } from "react-router";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
@@ -24,377 +23,88 @@ import {
  * HELPERS
  * ======================
  */
+
 function asInt(value, fallback = null) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
+
 function asString(value, fallback = "") {
   if (value === null || value === undefined) return fallback;
   return String(value);
 }
-function safeParseJsonArray(value) {
-  try {
-    const arr = JSON.parse(value);
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
-}
-function decodeMagentoHtml(html) {
-  if (!html) return "";
-  return he.decode(html);
-}
 
-function chunk(arr, size = 25) {
+function chunk(arr, size = 100) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
-// =========
-// HTML -> plain text (để tránh lỗi rich_text_field "invalid JSON")
-// =========
-function htmlToPlainText(html, he) {
-  const decoded = he ? he.decode(String(html ?? "")) : String(html ?? "");
 
-  return decoded
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>\s*<p>/gi, "\n\n")
-    .replace(/<\/?p[^>]*>/gi, "")
-    .replace(/<\/?[^>]+>/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
+function normalizePath(value) {
+  const raw = asString(value).trim();
+  if (!raw) return "";
 
-function pickErrorIndexFromUserError(field) {
-  if (!Array.isArray(field)) return null;
-  const i = field.find((x) => typeof x === "string" && /^\d+$/.test(x));
-  return i != null ? Number(i) : null;
-}
-function shortValue(v, max = 160) {
-  const s = typeof v === "string" ? v : JSON.stringify(v);
-  return s.length <= max ? s : s.slice(0, max) + "…";
-}
-
-// Shopify rich_text_field expects JSON document
-function toShopifyRichTextJSONFromHtml(html, he) {
-  const text = htmlToPlainText(html, he);
-  // RichText JSON tối thiểu: 1 paragraph
-  return JSON.stringify({
-    type: "root",
-    children: [
-      {
-        type: "paragraph",
-        children: text ? [{ type: "text", value: text }] : [],
-      },
-    ],
-  });
-}
-
-// =========
-// Magento API: product attributes
-// =========
-async function fetchMagentoProductAttributes(magentoUrl, magentoProductId) {
-  const res = await fetch(
-    `${magentoUrl}/rest/V1/shopify/product/${magentoProductId}/attributes`
-  );
-  if (!res.ok) throw new Error(`Fetch attributes failed (${res.status})`);
-
-  const json = await res.json();
-  if (json?.status !== "success") return [];
-  return Array.isArray(json?.items) ? json.items : [];
-}
-
-// =========
-// Shopify GraphQL: metaobject definitions (paginate)
-// =========
-async function listAllMetaobjectDefinitions(admin) {
-  const out = [];
-  let after = null;
-
-  while (true) {
-    const res = await admin.graphql(
-      `#graphql
-      query($after: String) {
-        metaobjectDefinitions(first: 250, after: $after) {
-          pageInfo { hasNextPage endCursor }
-          nodes { id type name }
-        }
-      }`,
-      { variables: { after } }
-    );
-
-    const json = await res.json();
-    const payload = json?.data?.metaobjectDefinitions;
-    const nodes = payload?.nodes ?? [];
-    out.push(...nodes);
-
-    if (!payload?.pageInfo?.hasNextPage) break;
-    after = payload.pageInfo.endCursor;
+  try {
+    if (raw.startsWith("http://") || raw.startsWith("https://")) {
+      return new URL(raw).pathname;
+    }
+  } catch {
+    // Keep raw path below.
   }
 
-  return out;
+  return raw.startsWith("/") ? raw : `/${raw}`;
 }
 
-// handle DB của bạn đang lưu dạng "$app:magento_color_option"
-// nhưng Shopify trả type thật dạng "app--xxxx--magento_color_option"
-function resolveMetaobjectTypeFromHandle(defs, handle) {
-  const h = String(handle ?? "").trim();
-  if (!h) return null;
-
-  const suffix = h.startsWith("$app:")
-    ? h.replace("$app:", "") // "magento_color_option"
-    : h;                     // nếu bạn lưu sẵn "app--...--magento_color_option"
-
-  // match theo hậu tố
-  const found = defs.find((d) => String(d?.type ?? "").endsWith(suffix));
-  return found?.type ?? null;
+function buildProductRedirectFrom(urlPath, urlKey) {
+  return normalizePath(urlPath || urlKey || "");
 }
 
-// =========
-// Shopify GraphQL: metaobjects entries map(label/value -> id) (paginate)
-// =========
-async function getMetaobjectOptionIdMap(admin, { metaobjectType, cache }) {
-  if (cache?.has(metaobjectType)) return cache.get(metaobjectType);
+function buildProductRedirectTo(handle) {
+  const h = asString(handle).trim();
+  return h ? `/products/${h}` : "";
+}
 
-  const map = new Map();
-  let after = null;
+function escapeCsvCell(value) {
+  const text = asString(value);
+  const doubleQuote = String.fromCharCode(34);
+  const lineFeed = String.fromCharCode(10);
+  const carriageReturn = String.fromCharCode(13);
 
-  while (true) {
-    const res = await admin.graphql(
-      `#graphql
-      query($type: String!, $after: String) {
-        metaobjects(type: $type, first: 250, after: $after) {
-          pageInfo { hasNextPage endCursor }
-          nodes {
-            id
-            fields { key value }
-          }
-        }
-      }`,
-      { variables: { type: metaobjectType, after } }
-    );
+  const mustQuote =
+    text.includes(doubleQuote) ||
+    text.includes(",") ||
+    text.includes(lineFeed) ||
+    text.includes(carriageReturn);
 
-    const json = await res.json();
-    const payload = json?.data?.metaobjects;
-    const nodes = payload?.nodes ?? [];
-
-    for (const n of nodes) {
-      const label = n.fields?.find((f) => f.key === "label")?.value;
-      const value = n.fields?.find((f) => f.key === "value")?.value;
-
-      if (label) map.set(String(label).trim(), n.id);
-      if (value) map.set(String(value).trim(), n.id);
-    }
-
-    if (!payload?.pageInfo?.hasNextPage) break;
-    after = payload.pageInfo.endCursor;
+  if (mustQuote) {
+    return doubleQuote + text.split(doubleQuote).join(doubleQuote + doubleQuote) + doubleQuote;
   }
 
-  cache?.set(metaobjectType, map);
-  return map;
+  return text;
 }
 
-// =========
-// Shopify GraphQL: metafieldsSet (chunked outside)
-// =========
-async function metafieldsSet(admin, metafields, { debugLabel = "" } = {}) {
-  const res = await admin.graphql(
-    `#graphql
-    mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        userErrors { field message }
-      }
-    }`,
-    { variables: { metafields } }
-  );
+function downloadRedirectCsv(items) {
+  if (typeof window === "undefined") return;
 
-  const json = await res.json();
-  const errs = json?.data?.metafieldsSet?.userErrors ?? [];
+  const rows = items
+    .filter((item) => item.redirectFrom && item.redirectTo)
+    .map((item) => [item.redirectFrom, item.redirectTo]);
 
-  if (!errs.length) return { ok: true, errors: [] };
+  const newline = String.fromCharCode(10);
+  const csv = [["Redirect from", "Redirect to"], ...rows]
+    .map((row) => row.map(escapeCsvCell).join(","))
+    .join(newline);
 
-  const details = errs.map((e) => {
-    const idx = pickErrorIndexFromUserError(e.field);
-    const input = idx != null ? metafields[idx] : null;
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
 
-    return {
-      debugLabel,
-      message: e.message,
-      field: e.field,
-      ownerId: input?.ownerId,
-      namespace: input?.namespace,
-      key: input?.key,
-      type: input?.type,
-      value: input ? shortValue(input.value) : null,
-    };
-  });
-
-  return { ok: false, errors: details };
-}
-
-
-async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin, {
-  magentoProductId,
-  shopifyProductId,
-  heLib, // truyền `he` vào cho tiện
-}) {
-  // 1) fetch Magento custom attributes
-  const attrs = await fetchMagentoProductAttributes(magentoUrl, magentoProductId);
-  if (!attrs.length) return { updated: 0 };
-
-  // 2) load mapping table: AttributeMapMetafield
-  const maps = await prisma.attributeMapMetafield.findMany({
-    where: { shopifyNamespace: "magento" },
-    select: {
-      magentoAttributeCode: true,
-      shopifyNamespace: true,
-      shopifyKey: true,
-      shopifyType: true,      // boolean / single_line_text_field / rich_text_field / metaobject_reference / list.metaobject_reference...
-      metaobjectHandle: true, // "$app:magento_color_option"
-    },
-  });
-
-  const mapByCode = new Map(maps.map((m) => [m.magentoAttributeCode, m]));
-
-  // 4) build metafields inputs
-  const mfInputs = [];
-
-  for (const a of attrs) {
-    const code = String(a?.attribute_code ?? "").trim();
-    if (!code) continue;
-
-    const m = mapByCode.get(code);
-    if (!m?.shopifyKey || !m?.shopifyType) continue;
-
-    const type = m.shopifyType;
-    const ns = m.shopifyNamespace || "magento";
-    const key = m.shopifyKey;
-
-    // ---- boolean ----
-    if (type === "boolean") {
-      mfInputs.push({
-        ownerId: shopifyProductId,
-        namespace: ns,
-        key,
-        type,
-        value: toBooleanString(a?.value),
-      });
-      continue;
-    }
-
-    // ---- rich_text_field (ví dụ short_description) ----
-    if (type === "rich_text_field") {
-      const html = String(a?.value ?? "");
-      const jsonRichText = toShopifyRichTextJSONFromHtml(html, heLib);
-      mfInputs.push({
-        ownerId: shopifyProductId,
-        namespace: ns,
-        key,
-        type,
-        value: jsonRichText, // ✅ phải là JSON string
-      });
-      continue;
-    }
-
-    // ---- single_line_text_field (select -> choice list) ----
-    if (type === "single_line_text_field") {
-      let v = pickMagentoValue(a); // ✅ lấy label
-
-      v = heLib ? heLib.decode(v) : v;
-      v = v
-        .replace(/<br\s*\/?>/gi, " ")
-        .replace(/<\/?[^>]+>/g, "")
-        .replace(/[\r\n]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-
-      if (v.length > 255) v = v.slice(0, 255);
-      if (!v) continue;
-
-      mfInputs.push({
-        ownerId: shopifyProductId,
-        namespace: ns,
-        key,
-        type,
-        value: v, // ✅ label
-      });
-
-      continue;
-    }
-
-    // ---- list.single_line_text_field (multiselect -> choice list) ----
-    if (type === "list.single_line_text_field") {
-      // ✅ ưu tiên label list
-      const raw = pickMagentoValue(a);
-
-      // Magento có thể trả "A,B,C" hoặc "A, B, C"
-      const parts = splitMulti(raw);
-
-      // sanitize + dedupe
-      const seen = new Set();
-      const cleaned = [];
-      for (let p of parts) {
-        p = heLib ? heLib.decode(p) : p;
-        p = p
-          .replace(/<br\s*\/?>/gi, " ")
-          .replace(/<\/?[^>]+>/g, "")
-          .replace(/[\r\n]+/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-
-        if (!p) continue;
-        const k = p.toLowerCase();
-        if (seen.has(k)) continue;
-        seen.add(k);
-        cleaned.push(p);
-      }
-
-      if (!cleaned.length) continue;
-
-      mfInputs.push({
-        ownerId: shopifyProductId,
-        namespace: ns,
-        key,
-        type,
-        value: JSON.stringify(cleaned), // ✅ ["Volltür","Glastür"]
-      });
-
-      continue;
-    }
-
-    // ---- default text/textarea/number_decimal/... ----
-    const v = pickMagentoValue(a);
-    if (!v) continue;
-
-    mfInputs.push({
-      ownerId: shopifyProductId,
-      namespace: ns,
-      key,
-      type,
-      value: v,
-    });
-  }
-
-  if (!mfInputs.length) return { updated: 0 };
-
-  // 5) metafieldsSet theo chunk
-  if (!mfInputs.length) return { updated: 0, errors: [] };
-  const batches = chunk(mfInputs, 25);
-  const errors = [];
-
-  for (let i = 0; i < batches.length; i++) {
-    const r = await metafieldsSet(admin, batches[i], {
-      debugLabel: `product=${shopifyProductId} batch=${i + 1}/${batches.length}`,
-    });
-
-    if (!r.ok) {
-      errors.push(...r.errors);
-      // nếu muốn dừng ngay khi có lỗi, uncomment dòng dưới:
-      // break;
-    }
-  }
-
-  return { updated: mfInputs.length, errors };
+  link.href = url;
+  link.download = "shopify-product-redirects.csv";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
 }
 
 /**
@@ -402,60 +112,180 @@ async function syncMagentoCustomAttributesToProductMetafields(magentoUrl, admin,
  * SHOPIFY HELPERS
  * ======================
  */
-function toBooleanString(v) {
-  const s = String(v ?? "").trim().toLowerCase();
-  return s === "1" || s === "true" || s === "yes" ? "true" : "false";
+
+async function getFirstLocationId(admin) {
+  const res = await admin.graphql(
+    `#graphql
+    query {
+      locations(first: 5) {
+        nodes { id name }
+      }
+    }`
+  );
+
+  const json = await res.json();
+  const loc = json?.data?.locations?.nodes?.[0];
+  if (!loc?.id) throw new Error("No location found");
+  return loc.id;
 }
 
-// dùng cho text/textarea/number...
-function pickMagentoValue(attr) {
-  // ưu tiên value_label nếu có (select/multiselect cần label để match choice list)
-  const v = attr?.value_label ?? attr?.value;
-  return v == null ? "" : String(v).trim();
+async function getShopifyProductHandles(admin, productIds) {
+  const uniqueIds = [...new Set(productIds.filter(Boolean))];
+  const handleMap = new Map();
+
+  for (const ids of chunk(uniqueIds, 100)) {
+    const res = await admin.graphql(
+      `#graphql
+      query GetProducts($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Product {
+            id
+            handle
+          }
+        }
+      }`,
+      { variables: { ids } }
+    );
+
+    const json = await res.json();
+    const nodes = json?.data?.nodes ?? [];
+
+    for (const node of nodes) {
+      if (node?.id && node?.handle) {
+        handleMap.set(node.id, node.handle);
+      }
+    }
+  }
+
+  return handleMap;
 }
 
-// multiselect thường trả "1,2,3" hoặc label "A,B,C"
-function splitMulti(v) {
-  return String(v ?? "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
+async function getProductFirstVariant(admin, productId) {
+  const res = await admin.graphql(
+    `#graphql
+    query GetProductVariant($id: ID!) {
+      product(id: $id) {
+        id
+        handle
+        variants(first: 1) {
+          nodes {
+            id
+            inventoryItem { id }
+          }
+        }
+      }
+    }`,
+    { variables: { id: productId } }
+  );
+
+  const json = await res.json();
+  const product = json?.data?.product;
+  const variant = product?.variants?.nodes?.[0];
+
+  if (!product?.id || !variant?.id || !variant?.inventoryItem?.id) {
+    throw new Error("Missing product variant or inventory item");
+  }
+
+  return {
+    productId: product.id,
+    handle: product.handle,
+    variantId: variant.id,
+    inventoryItemId: variant.inventoryItem.id,
+  };
 }
 
-function mapWeightUnit(unit) {
-  const u = String(unit || "").toLowerCase();
-  if (u === "g" || u === "gram" || u === "grams") return "GRAMS";
-  if (u === "oz" || u === "ounce" || u === "ounces") return "OUNCES";
-  if (u === "lb" || u === "lbs" || u === "pound" || u === "pounds") return "POUNDS";
-  // default
-  return "KILOGRAMS";
+async function createProductMinimal(admin, { title }) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation CreateProduct($input: ProductInput!) {
+      productCreate(input: $input) {
+        product {
+          id
+          handle
+          variants(first: 1) {
+            nodes {
+              id
+              inventoryItem { id }
+            }
+          }
+        }
+        userErrors { message }
+      }
+    }`,
+    {
+      variables: {
+        input: {
+          title,
+        },
+      },
+    }
+  );
+
+  const json = await res.json();
+  const payload = json?.data?.productCreate;
+  const errs = payload?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+
+  const product = payload?.product;
+  const variant = product?.variants?.nodes?.[0];
+
+  if (!product?.id || !variant?.id || !variant?.inventoryItem?.id) {
+    throw new Error("productCreate: missing product/variant/inventoryItem id");
+  }
+
+  return {
+    productId: product.id,
+    handle: product.handle,
+    variantId: variant.id,
+    inventoryItemId: variant.inventoryItem.id,
+    created: true,
+  };
 }
 
+async function updateVariantPrice(admin, { productId, variantId, price }) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation UpdateVariantPrice(
+      $productId: ID!
+      $variants: [ProductVariantsBulkInput!]!
+    ) {
+      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+        userErrors { message }
+      }
+    }`,
+    {
+      variables: {
+        productId,
+        variants: [
+          {
+            id: variantId,
+            price: asString(price || "0"),
+          },
+        ],
+      },
+    }
+  );
 
-async function updateInventoryItemWeight(admin, { inventoryItemId, weight, weightUnit = "kg" }) {
-  const w = Number(weight);
-  if (!inventoryItemId) return;
-  if (!Number.isFinite(w)) return;
+  const json = await res.json();
+  const errs = json?.data?.productVariantsBulkUpdate?.userErrors ?? [];
+  if (errs.length) throw new Error(errs[0].message);
+}
+
+async function updateInventoryItemSku(admin, { inventoryItemId, sku }) {
+  if (!sku) return;
 
   const res = await admin.graphql(
     `#graphql
-    mutation UpdateInvItem($id: ID!, $input: InventoryItemInput!) {
+    mutation UpdateInventoryItemSku($id: ID!, $input: InventoryItemInput!) {
       inventoryItemUpdate(id: $id, input: $input) {
-        inventoryItem { id }
-        userErrors { field message }
+        inventoryItem { id sku }
+        userErrors { message }
       }
     }`,
     {
       variables: {
         id: inventoryItemId,
-        input: {
-          measurement: {
-            weight: {
-              value: w,
-              unit: mapWeightUnit(weightUnit), // KILOGRAMS/GRAMS/OUNCES/POUNDS
-            },
-          },
-        },
+        input: { sku },
       },
     }
   );
@@ -464,6 +294,7 @@ async function updateInventoryItemWeight(admin, { inventoryItemId, weight, weigh
   const errs = json?.data?.inventoryItemUpdate?.userErrors ?? [];
   if (errs.length) throw new Error(errs[0].message);
 }
+
 async function setInventoryTracked(admin, { inventoryItemId, tracked = true }) {
   const res = await admin.graphql(
     `#graphql
@@ -473,107 +304,17 @@ async function setInventoryTracked(admin, { inventoryItemId, tracked = true }) {
         userErrors { message }
       }
     }`,
-    { variables: { id: inventoryItemId, input: { tracked } } }
+    {
+      variables: {
+        id: inventoryItemId,
+        input: { tracked },
+      },
+    }
   );
 
   const json = await res.json();
   const errs = json?.data?.inventoryItemUpdate?.userErrors ?? [];
   if (errs.length) throw new Error(errs[0].message);
-
-  return json?.data?.inventoryItemUpdate?.inventoryItem ?? null;
-}
-
-
-async function getProductImageMediaIds(admin, productId) {
-  const res = await admin.graphql(
-    `#graphql
-    query GetMedia($id: ID!) {
-      product(id: $id) {
-        media(first: 250) {
-          nodes {
-            __typename
-            ... on MediaImage { id }
-          }
-        }
-      }
-    }`,
-    { variables: { id: productId } }
-  );
-
-  const json = await res.json();
-  const nodes = json?.data?.product?.media?.nodes ?? [];
-  return nodes
-    .filter((m) => m.__typename === "MediaImage" && m.id)
-    .map((m) => m.id);
-}
-
-async function deleteProductMedia(admin, productId, mediaIds) {
-  if (!mediaIds?.length) return;
-
-  const res = await admin.graphql(
-    `#graphql
-    mutation DeleteMedia($productId: ID!, $mediaIds: [ID!]!) {
-      productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
-        deletedMediaIds
-        userErrors { message }
-      }
-    }`,
-    { variables: { productId, mediaIds } }
-  );
-
-  const json = await res.json();
-  const errs = json?.data?.productDeleteMedia?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-}
-
-
-async function getOnlineStorePublicationId(admin) {
-  const res = await admin.graphql(
-    `#graphql
-    query {
-      publications(first: 20) {
-        nodes { id name }
-      }
-    }`,
-  );
-  const json = await res.json();
-  const pubs = json?.data?.publications?.nodes ?? [];
-  const onlineStore = pubs.find((p) => p.name === "Online Store");
-  if (!onlineStore) throw new Error("Online Store publication not found");
-  return onlineStore.id;
-}
-
-async function publishProduct(admin, productId) {
-  const publicationId = await getOnlineStorePublicationId(admin);
-
-  const res = await admin.graphql(
-    `#graphql
-    mutation Publish($id: ID!, $pub: ID!) {
-      publishablePublish(id: $id, input: { publicationId: $pub }) {
-        userErrors { message }
-      }
-    }`,
-    { variables: { id: productId, pub: publicationId } },
-  );
-
-  const json = await res.json();
-  const errs = json?.data?.publishablePublish?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-}
-
-async function getFirstLocationId(admin) {
-  const res = await admin.graphql(
-    `#graphql
-    query {
-      locations(first: 5) {
-        nodes { id name }
-      }
-    }`,
-  );
-  const json = await res.json();
-  const loc = json?.data?.locations?.nodes?.[0];
-  if (!loc?.id) throw new Error("No location found");
-  return loc.id;
 }
 
 async function activateInventoryItem(admin, { inventoryItemId, locationId }) {
@@ -588,7 +329,10 @@ async function activateInventoryItem(admin, { inventoryItemId, locationId }) {
       }
     }`,
     {
-      variables: { inventoryItemId, locationId },
+      variables: {
+        inventoryItemId,
+        locationId,
+      },
     }
   );
 
@@ -618,7 +362,7 @@ async function setInventoryOnHand(admin, { inventoryItemId, locationId, quantity
           ],
         },
       },
-    },
+    }
   );
 
   const json = await res.json();
@@ -626,231 +370,47 @@ async function setInventoryOnHand(admin, { inventoryItemId, locationId, quantity
   if (errs.length) throw new Error(errs[0].message);
 }
 
-async function updateInventoryItemSku(admin, { inventoryItemId, sku }) {
-  if (!sku) return;
-  const res = await admin.graphql(
-    `#graphql
-    mutation UpdateInvItem($id: ID!, $input: InventoryItemInput!) {
-      inventoryItemUpdate(id: $id, input: $input) {
-        inventoryItem { id sku }
-        userErrors { message }
-      }
-    }`,
-    {
-      variables: {
-        id: inventoryItemId,
-        input: { sku },
-      },
-    },
-  );
-  const json = await res.json();
-  const errs = json?.data?.inventoryItemUpdate?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-}
+async function syncProductPriceStock(admin, { productId, title, sku, price, qty }) {
+  let base;
 
-async function updateVariantPricing(admin, {
-  productId,
-  variantId,
-  price,
-}) {
-  const res = await admin.graphql(
-    `#graphql
-    mutation UpdateVariant(
-      $productId: ID!
-      $variants: [ProductVariantsBulkInput!]!
-    ) {
-      productVariantsBulkUpdate(
-        productId: $productId
-        variants: $variants
-      ) {
-        userErrors { message }
-      }
-    }`,
-    {
-      variables: {
-        productId,
-        variants: [
-          {
-            id: variantId,
-            price: price?.toString() ?? "0",
-          },
-        ],
-      },
-    },
-  );
-
-  const json = await res.json();
-  const errs = json?.data?.productVariantsBulkUpdate?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-}
-
-async function createOrUpdateProductBase(admin, { productId, title, descriptionHtml, seoTitle, seoDescription }) {
-  // Nếu có productId => update, không có => create
-  if (!productId) {
-    const res = await admin.graphql(
-      `#graphql
-      mutation CreateProduct($input: ProductInput!) {
-        productCreate(input: $input) {
-          product {
-            id
-            variants(first: 1) {
-              nodes {
-                id
-                inventoryItem { id }
-              }
-            }
-          }
-          userErrors { message }
-        }
-      }`,
-      {
-        variables: {
-          input: {
-            title,
-            descriptionHtml,
-            seo: {
-              title: seoTitle,
-              description: seoDescription,
-            },
-          },
-        },
-      },
-    );
-
-    const json = await res.json();
-    const payload = json?.data?.productCreate;
-    const errs = payload?.userErrors ?? [];
-    if (errs.length) throw new Error(errs[0].message);
-
-    const p = payload?.product;
-    const v = p?.variants?.nodes?.[0];
-    if (!p?.id || !v?.id || !v?.inventoryItem?.id) {
-      throw new Error("productCreate: missing product/variant/inventoryItem id");
-    }
-
-    return {
-      productId: p.id,
-      variantId: v.id,
-      inventoryItemId: v.inventoryItem.id,
-      created: true,
-    };
+  if (productId) {
+    base = await getProductFirstVariant(admin, productId);
+    base.created = false;
+  } else {
+    base = await createProductMinimal(admin, { title });
   }
 
-  const res = await admin.graphql(
-    `#graphql
-    mutation UpdateProduct($input: ProductInput!) {
-      productUpdate(input: $input) {
-        product {
-          id
-          variants(first: 1) {
-            nodes {
-              id
-              inventoryItem { id }
-            }
-          }
-        }
-        userErrors { message }
-      }
-    }`,
-    {
-      variables: {
-        input: {
-          id: productId,
-          title,
-          descriptionHtml,
-          seo: {
-            title: seoTitle,
-            description: seoDescription,
-          },
-        },
-      },
-    },
-  );
+  await updateVariantPrice(admin, {
+    productId: base.productId,
+    variantId: base.variantId,
+    price,
+  });
 
-  const json = await res.json();
-  const payload = json?.data?.productUpdate;
-  const errs = payload?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
+  await updateInventoryItemSku(admin, {
+    inventoryItemId: base.inventoryItemId,
+    sku,
+  });
 
-  const p = payload?.product;
-  const v = p?.variants?.nodes?.[0];
-  if (!p?.id || !v?.id || !v?.inventoryItem?.id) {
-    throw new Error("productUpdate: missing product/variant/inventoryItem id");
-  }
+  const locationId = await getFirstLocationId(admin);
 
-  return {
-    productId: p.id,
-    variantId: v.id,
-    inventoryItemId: v.inventoryItem.id,
-    created: false,
-  };
+  await setInventoryTracked(admin, {
+    inventoryItemId: base.inventoryItemId,
+    tracked: true,
+  });
+
+  await activateInventoryItem(admin, {
+    inventoryItemId: base.inventoryItemId,
+    locationId,
+  });
+
+  await setInventoryOnHand(admin, {
+    inventoryItemId: base.inventoryItemId,
+    locationId,
+    quantity: qty,
+  });
+
+  return base;
 }
-
-async function fetchMagentoProductImages(magentoUrl, magentoProductId) {
-  const res = await fetch(
-    `${magentoUrl}/rest/V1/shopify/product/${magentoProductId}/images`
-  );
-
-  if (!res.ok) {
-    throw new Error(`Fetch images failed (${res.status})`);
-  }
-
-  const data = await res.json();
-  console.log(data);
-  // data dạng: ["success", [url1, url2]]
-  const status = data?.[0];
-  const list = data?.[1];
-
-  if (status !== "success") return [];
-  if (!Array.isArray(list)) return [];
-
-  // clean + unique
-  return Array.from(
-    new Set(list.map((u) => String(u || "").trim()).filter(Boolean))
-  );
-}
-async function addProductImages(magentoUrl, admin, {
-  productId,
-  magentoProductId,
-  replaceExisting = false,
-}) {
-  // lấy danh sách từ API mới
-  const apiUrls = magentoProductId
-    ? await fetchMagentoProductImages(magentoUrl, magentoProductId)
-    : [];
-
-  // nếu vẫn có imageUrl thì đưa lên đầu, và remove trùng trong apiUrls
-  let gallery = apiUrls;
-  // if (imageUrl) gallery = gallery.filter((u) => u !== imageUrl);
-
-  // const urls = [...(imageUrl ? [imageUrl] : []), ...gallery].filter(Boolean);
-  if (!gallery.length) return;
-
-  if (replaceExisting) {
-    const oldMediaIds = await getProductImageMediaIds(admin, productId);
-    await deleteProductMedia(admin, productId, oldMediaIds);
-  }
-
-  const media = gallery.map((u) => ({
-    mediaContentType: "IMAGE",
-    originalSource: u,
-  }));
-
-  const res = await admin.graphql(
-    `#graphql
-    mutation AddMedia($productId: ID!, $media: [CreateMediaInput!]!) {
-      productCreateMedia(productId: $productId, media: $media) {
-        userErrors { message }
-      }
-    }`,
-    { variables: { productId, media } }
-  );
-
-  const json = await res.json();
-  const errs = json?.data?.productCreateMedia?.userErrors ?? [];
-  if (errs.length) throw new Error(errs[0].message);
-}
-
 
 /**
  * ======================
@@ -864,13 +424,11 @@ export const loader = async ({ request }) => {
 };
 
 export const action = async ({ request }) => {
-//   const { admin } = await authenticate.admin(request);
-  const { admin, session } = await authenticate.admin(request);
+  const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
-  // const locationId = await getFirstLocationId(admin);
 
-  const intentsNeedMagento = new Set(["fetch", "sync", "resync"]);
+  const intentsNeedMagento = new Set(["fetch", "sync", "resync", "sync_product_urls"]);
   let MAGENTO_BASE = null;
 
   if (intentsNeedMagento.has(intent)) {
@@ -884,18 +442,20 @@ export const action = async ({ request }) => {
       };
     }
   }
-  
+
   /**
    * FETCH MAGENTO PRODUCTS
    */
   if (intent === "fetch") {
     const page = Number(formData.get("page")) || 1;
     const pageSize = Number(formData.get("page_size")) || 1000;
+    const productId = String(formData.get("product_id") ?? "").trim();
+
     const url = new URL(`${MAGENTO_BASE}/rest/V1/shopify/products`);
     url.searchParams.set("page", String(page));
     url.searchParams.set("page_size", String(pageSize));
-    const productId = String(formData.get("product_id") ?? "").trim();
     if (productId) url.searchParams.set("product_id", productId);
+
     const res = await fetch(url.toString());
 
     if (!res.ok) {
@@ -903,12 +463,21 @@ export const action = async ({ request }) => {
     }
 
     const magento = await res.json();
-
     const mapped = await prisma.productMapMagento.findMany();
-    const mappedByMagentoId = new Map(mapped.map((m) => [m.magentoProductId, m]));
+    const mappedByMagentoId = new Map(
+      mapped.map((m) => [Number(m.magentoProductId), m])
+    );
+
+    const handleMap = await getShopifyProductHandles(
+      admin,
+      mapped.map((m) => m.shopifyProductId)
+    );
 
     const items = (magento.items ?? []).map((p) => {
-      const map = mappedByMagentoId.get(p.product_id);
+      const map = mappedByMagentoId.get(Number(p.product_id));
+      const shopifyHandle = map?.shopifyProductId
+        ? handleMap.get(map.shopifyProductId)
+        : "";
 
       return {
         magentoProductId: p.product_id,
@@ -916,16 +485,14 @@ export const action = async ({ request }) => {
         sku: p.sku,
         price: p.special_price ?? p.price,
         qty: p.salable_qty ?? p.qty ?? 0,
+        urlPath: p.url_path,
+        urlKey: p.url_key,
 
         shopifyProductId: map?.shopifyProductId ?? null,
         isSynced: Boolean(map),
-        weight: p.weight ?? 0,
-        // fields needed for sync/resync
-        description: p.description,
-        metaTitle: p.meta_title,
-        metaDescription: p.meta_description,
-        imageUrl: p.image_url,
-        galleryJson: p.gallery_json,
+
+        redirectFrom: map?.redirectFrom ?? buildProductRedirectFrom(p.url_path, p.url_key),
+        redirectTo: map?.redirectTo ?? buildProductRedirectTo(shopifyHandle),
       };
     });
 
@@ -939,7 +506,74 @@ export const action = async ({ request }) => {
   }
 
   /**
-   * SYNC / RESYNC (simple product)
+   * SYNC PRODUCT URLS TO DATABASE
+   */
+  if (intent === "sync_product_urls") {
+    const page = Number(formData.get("page")) || 1;
+    const pageSize = Number(formData.get("page_size")) || 1000;
+
+    const url = new URL(`${MAGENTO_BASE}/rest/V1/shopify/products`);
+    url.searchParams.set("page", String(page));
+    url.searchParams.set("page_size", String(pageSize));
+
+    const res = await fetch(url.toString());
+
+    if (!res.ok) {
+      throw new Response("Failed to fetch Magento products", { status: 500 });
+    }
+
+    const magento = await res.json();
+    const magentoById = new Map(
+      (magento.items ?? []).map((p) => [Number(p.product_id), p])
+    );
+
+    const mapped = await prisma.productMapMagento.findMany({
+      select: {
+        magentoProductId: true,
+        shopifyProductId: true,
+      },
+    });
+
+    const handleMap = await getShopifyProductHandles(
+      admin,
+      mapped.map((m) => m.shopifyProductId)
+    );
+
+    let updated = 0;
+    let skipped = 0;
+
+    for (const map of mapped) {
+      const magentoProduct = magentoById.get(Number(map.magentoProductId));
+      const shopifyHandle = handleMap.get(map.shopifyProductId);
+
+      const redirectFrom = buildProductRedirectFrom(
+        magentoProduct?.url_path,
+        magentoProduct?.url_key
+      );
+      const redirectTo = buildProductRedirectTo(shopifyHandle);
+
+      if (!redirectFrom || !redirectTo) {
+        skipped += 1;
+        continue;
+      }
+
+      await prisma.productMapMagento.update({
+        where: { magentoProductId: map.magentoProductId },
+        data: {
+          redirectFrom,
+          redirectTo,
+        },
+      });
+
+      updated += 1;
+    }
+
+    return { success: true, updated, skipped };
+  }
+
+  /**
+   * SYNC / RESYNC PRODUCT
+   * Chỉ update price + stock qty + URL fields.
    */
   if (intent === "sync" || intent === "resync") {
     const magentoProductId = asInt(formData.get("magentoProductId"));
@@ -947,116 +581,31 @@ export const action = async ({ request }) => {
     const sku = asString(formData.get("sku"));
     const price = asString(formData.get("price"));
     const qty = asInt(formData.get("qty"), 0);
-    const weight = asString(formData.get("weight"));
-    const descriptionRaw = asString(formData.get("description"));
-    const description = decodeMagentoHtml(descriptionRaw);
-    const metaTitle = asString(formData.get("metaTitle"));
-    const metaDescription = asString(formData.get("metaDescription"));
-    // const imageUrl = asString(formData.get("imageUrl"));
-    // const galleryJson = asString(formData.get("galleryJson"));
+    const redirectFrom = normalizePath(formData.get("redirectFrom"));
+    const redirectToFromForm = normalizePath(formData.get("redirectTo"));
 
     if (!magentoProductId || !name) {
       throw new Response("Missing required fields", { status: 400 });
     }
 
-    // find mapped product for resync
-    let existing = null;
-    if (intent === "resync") {
-      existing = await prisma.productMapMagento.findUnique({
-        where: { magentoProductId },
-      });
-      if (!existing?.shopifyProductId) {
-        throw new Error("This product is not synced yet");
-      }
+    const existing = await prisma.productMapMagento.findUnique({
+      where: { magentoProductId },
+    });
+
+    if (intent === "resync" && !existing?.shopifyProductId) {
+      throw new Error("This product is not synced yet");
     }
 
-    // 1) create or update base product (title/desc/seo) and get default variant + inventoryItem
-    const base = await createOrUpdateProductBase(admin, {
+    const base = await syncProductPriceStock(admin, {
       productId: existing?.shopifyProductId ?? null,
       title: name,
-      descriptionHtml: description || "",
-      seoTitle: metaTitle || name,
-      seoDescription: metaDescription || "",
-    });
-
-    // 2) update variant price (API mới: bulk update)
-    await updateVariantPricing(admin, {
-      productId: base.productId,
-      variantId: base.variantId,
-      price
-    });
-    // 3) update SKU (inventoryItemUpdate)
-    await updateInventoryItemSku(admin, {
-      inventoryItemId: base.inventoryItemId,
       sku,
+      price,
+      qty,
     });
 
-    await updateInventoryItemWeight(admin, {
-      inventoryItemId: base.inventoryItemId,
-      weight,          // lấy từ formData (Magento)
-      weightUnit: "kg" // hoặc nếu sau này bạn có unit từ Magento thì truyền vào
-    });
+    const redirectTo = redirectToFromForm || buildProductRedirectTo(base.handle);
 
-    // 4) inventory on hand
-    const locationId = await getFirstLocationId(admin);
-
-    // ✅ 4.0) bật tracking để Shopify theo dõi tồn kho (hết "Inventory not tracked")
-    await setInventoryTracked(admin, {
-      inventoryItemId: base.inventoryItemId,
-      tracked: true,
-    });
-
-    // 🔥 4.1) BẮT BUỘC activate trước khi set quantity
-    await activateInventoryItem(admin, {
-      inventoryItemId: base.inventoryItemId,
-      locationId,
-    });
-
-    // 4.2) set on hand
-    await setInventoryOnHand(admin, {
-      inventoryItemId: base.inventoryItemId,
-      locationId,
-      quantity: qty,
-    });
-
-    // 5) images
-    await addProductImages(MAGENTO_BASE, admin, {
-        productId: base.productId,
-        // imageUrl,
-        magentoProductId,
-        replaceExisting: intent === "resync",
-    });
-
-    const mfResult = await syncMagentoCustomAttributesToProductMetafields(MAGENTO_BASE, admin, {
-      magentoProductId,
-      shopifyProductId: base.productId,
-      heLib: he,
-    });
-
-    if (mfResult?.errors?.length) {
-      // ✅ trả về để show trên page
-      return {
-        success: false,
-        intent,
-        magentoProductId,
-        shopifyProductId: base.productId,
-        errorType: "METAFIELD_SET_ERRORS",
-        debugErrors: mfResult.errors,
-      };
-    }
-
-    // 6) publish product
-    await publishProduct(admin, base.productId);
-
-    // await updateVariantWeightREST(session,{
-    //     shop: session.shop,
-    //     accessToken: session.accessToken,
-    //     variantId: base.variantId,
-    //     weight: weight, // kg
-    //     unit: "kg",
-    // });
-
-    // 7) upsert mapping DB
     await prisma.productMapMagento.upsert({
       where: { magentoProductId },
       create: {
@@ -1064,11 +613,15 @@ export const action = async ({ request }) => {
         shopifyProductId: base.productId,
         sku: sku || null,
         name,
+        redirectFrom,
+        redirectTo,
       },
       update: {
         shopifyProductId: base.productId,
         sku: sku || null,
         name,
+        redirectFrom,
+        redirectTo,
       },
     });
 
@@ -1090,36 +643,13 @@ export const action = async ({ request }) => {
  * ======================
  */
 
-function RowActions({ item, onDone, disabled, shopify, onError, onClearError }) {
+function RowActions({ item, onDone, disabled, shopify }) {
   const syncFetcher = useFetcher();
   const resyncFetcher = useFetcher();
 
   const syncing = syncFetcher.state === "loading" || syncFetcher.state === "submitting";
-  const resyncing = resyncFetcher.state === "loading" || resyncFetcher.state === "submitting";
-
-  const errData =
-    (syncFetcher.data?.success === false && syncFetcher.data?.errorType === "METAFIELD_SET_ERRORS"
-      ? syncFetcher.data
-      : null) ||
-    (resyncFetcher.data?.success === false && resyncFetcher.data?.errorType === "METAFIELD_SET_ERRORS"
-      ? resyncFetcher.data
-      : null);
-
-  useEffect(() => {
-    if (errData) {
-      onError?.({
-        ...errData,
-        magentoProductId: item.magentoProductId,
-        name: item.name,
-      });
-    }
-  }, [errData, onError, item.magentoProductId, item.name]);
-
-  useEffect(() => {
-    if (syncFetcher.state === "submitting" || resyncFetcher.state === "submitting") {
-      onClearError?.();
-    }
-  }, [syncFetcher.state, resyncFetcher.state, onClearError]);
+  const resyncing =
+    resyncFetcher.state === "loading" || resyncFetcher.state === "submitting";
 
   useEffect(() => {
     if (syncFetcher.state === "idle" && syncFetcher.data?.success) {
@@ -1135,7 +665,6 @@ function RowActions({ item, onDone, disabled, shopify, onError, onClearError }) 
     }
   }, [resyncFetcher.state, resyncFetcher.data, shopify, onDone]);
 
-
   const HiddenFields = () => (
     <>
       <input type="hidden" name="magentoProductId" value={item.magentoProductId} />
@@ -1143,12 +672,8 @@ function RowActions({ item, onDone, disabled, shopify, onError, onClearError }) 
       <input type="hidden" name="sku" value={asString(item.sku)} />
       <input type="hidden" name="price" value={asString(item.price)} />
       <input type="hidden" name="qty" value={asString(item.qty)} />
-      <input type="hidden" name="description" value={asString(item.description)} />
-      <input type="hidden" name="metaTitle" value={asString(item.metaTitle)} />
-      <input type="hidden" name="metaDescription" value={asString(item.metaDescription)} />
-      <input type="hidden" name="imageUrl" value={asString(item.imageUrl)} />
-      <input type="hidden" name="galleryJson" value={asString(item.galleryJson)} />
-      <input type="hidden" name="weight" value={asString(item.weight)} />
+      <input type="hidden" name="redirectFrom" value={asString(item.redirectFrom)} />
+      <input type="hidden" name="redirectTo" value={asString(item.redirectTo)} />
     </>
   );
 
@@ -1186,42 +711,50 @@ function RowActions({ item, onDone, disabled, shopify, onError, onClearError }) 
 
 export default function ProductPage() {
   const fetcher = useFetcher();
+  const syncUrlsFetcher = useFetcher();
   const shopify = useAppBridge();
+
   const [page, setPage] = useState(1);
   const [pageInput, setPageInput] = useState("1");
   const [searchId, setSearchId] = useState("");
   const [isBulkSyncing, setIsBulkSyncing] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [pageInputFocusValue, setPageInputFocusValue] = useState("");
+
   const items = fetcher.data?.items ?? [];
-
-   const [mfError, setMfError] = useState(null);
-
-  // test sync 10
-  const unsyncedItems = items.filter((i) => !i.isSynced);//.slice(0, 10);
-  const allSynced = unsyncedItems.length === 0;
+  const unsyncedItems = items.filter((i) => !i.isSynced);
   const syncedItems = items.filter((i) => i.isSynced);
+  const allSynced = unsyncedItems.length === 0;
   const allResynced = syncedItems.length === 0;
+  const syncingUrls = syncUrlsFetcher.state !== "idle";
+
+  const pageInfo = fetcher.data
+    ? {
+        page: fetcher.data.page ?? 1,
+        totalPage: fetcher.data.total_page ?? 1,
+        total: fetcher.data.total ?? 0,
+        pageSize: fetcher.data.page_size ?? 1000,
+      }
+    : { page: 1, totalPage: 1, total: 0, pageSize: 1000 };
 
   const handleFetch = (nextPage = page, nextProductId = searchId) => {
+    let targetPage = nextPage;
+
     if (String(nextProductId || "").trim().length > 0) {
-      nextPage = 1;
+      targetPage = 1;
     }
-    setPage(nextPage);
+
+    setPage(targetPage);
     fetcher.submit(
-      { intent: "fetch", page: String(nextPage), page_size: "1000",product_id: String(nextProductId || "").trim(), },
+      {
+        intent: "fetch",
+        page: String(targetPage),
+        page_size: "1000",
+        product_id: String(nextProductId || "").trim(),
+      },
       { method: "POST" }
     );
   };
-
-  const pageInfo = fetcher.data
-  ? {
-      page: fetcher.data.page ?? 1,
-      totalPage: fetcher.data.total_page ?? 1,
-      total: fetcher.data.total ?? 0,
-      pageSize: fetcher.data.page_size ?? 1000,
-    }
-  : { page: 1, totalPage: 1, total: 0, pageSize: 1000 };
 
   useEffect(() => {
     if (fetcher.state === "idle" && fetcher.data?.page != null) {
@@ -1229,95 +762,78 @@ export default function ProductPage() {
       setPageInput(String(fetcher.data.page));
     }
   }, [fetcher.state, fetcher.data?.page]);
-  
-  // auto fetch (same as category)
+
   useEffect(() => {
     const t = setTimeout(() => handleFetch(1), 200);
     return () => clearTimeout(t);
   }, []);
 
+  useEffect(() => {
+    if (syncUrlsFetcher.state === "idle" && syncUrlsFetcher.data?.success) {
+      const updated = Number(syncUrlsFetcher.data?.updated || 0);
+      const skipped = Number(syncUrlsFetcher.data?.skipped || 0);
+      shopify.toast.show(`Synced product URLs: ${updated} updated, ${skipped} skipped`);
+      handleFetch(page);
+    }
+  }, [syncUrlsFetcher.state]);
+
+  const syncProductUrls = () => {
+    syncUrlsFetcher.submit(
+      {
+        intent: "sync_product_urls",
+        page: String(pageInfo.page || page),
+        page_size: String(pageInfo.pageSize || 1000),
+      },
+      { method: "POST" }
+    );
+  };
+
+  const handleExportRedirectCsv = () => {
+    downloadRedirectCsv(items);
+    shopify.toast.show("Product redirect CSV exported");
+  };
+
+  const submitBulkProduct = async (item, intentName) => {
+    const fd = new FormData();
+    fd.append("intent", intentName);
+    fd.append("magentoProductId", item.magentoProductId);
+    fd.append("name", item.name);
+    fd.append("sku", item.sku || "");
+    fd.append("price", item.price || "");
+    fd.append("qty", item.qty ?? 0);
+    fd.append("redirectFrom", item.redirectFrom || "");
+    fd.append("redirectTo", item.redirectTo || "");
+
+    await fetch(window.location.pathname, {
+      method: "POST",
+      body: fd,
+    });
+  };
+
   const resyncAll = async () => {
     if (syncedItems.length === 0) return;
-    setMfError(null); // ✅ clear banner cũ
+
     setIsBulkSyncing(true);
     setProgress({ done: 0, total: syncedItems.length });
 
     for (const item of syncedItems) {
-      const fd = new FormData();
-      fd.append("intent", "resync"); // 🔥 khác sync
-      fd.append("magentoProductId", item.magentoProductId);
-      fd.append("name", item.name);
-      fd.append("sku", item.sku || "");
-      fd.append("price", item.price || "");
-      fd.append("qty", item.qty ?? 0);
-      fd.append("weight", item.weight ?? 0);
-
-      fd.append("description", item.description || "");
-      fd.append("metaTitle", item.metaTitle || "");
-      fd.append("metaDescription", item.metaDescription || "");
-      fd.append("imageUrl", item.imageUrl || "");
-      fd.append("galleryJson", item.galleryJson || "");
-
-      const resp = await fetch(window.location.pathname, {
-        method: "POST",
-        body: fd,
-      });
-
-      let json = null;
-      try {
-        json = await resp.json();
-      } catch {}
-
-      if (json?.success === false && json?.errorType === "METAFIELD_SET_ERRORS") {
-        setMfError({ ...json, magentoProductId: item.magentoProductId, name: item.name });
-        setIsBulkSyncing(false);
-        return; // ✅ dừng luôn (tuỳ bạn)
-      }
+      await submitBulkProduct(item, "resync");
       setProgress((p) => ({ ...p, done: p.done + 1 }));
     }
 
     setIsBulkSyncing(false);
     handleFetch(page);
-    shopify.toast.show("All products re-synced");
+    shopify.toast.show("All synced products updated");
   };
 
   const syncAll = async () => {
     if (unsyncedItems.length === 0) return;
-    setMfError(null); // ✅ clear banner cũ
+
     setIsBulkSyncing(true);
     setProgress({ done: 0, total: unsyncedItems.length });
 
     for (const item of unsyncedItems) {
-      const fd = new FormData();
-      fd.append("intent", "sync");
-      fd.append("magentoProductId", item.magentoProductId);
-      fd.append("name", item.name);
-      fd.append("sku", item.sku || "");
-      fd.append("price", item.price || "");
-      fd.append("qty", item.qty ?? 0);
-
-      fd.append("description", item.description || "");
-      fd.append("metaTitle", item.metaTitle || "");
-      fd.append("metaDescription", item.metaDescription || "");
-      fd.append("imageUrl", item.imageUrl || "");
-      fd.append("galleryJson", item.galleryJson || "");
-      fd.append("weight", item.weight ?? 0);
-
-      const resp = await fetch(window.location.pathname, {
-        method: "POST",
-        body: fd,
-      });
-
-      let json = null;
-      try {
-        json = await resp.json();
-      } catch {}
-
-      if (json?.success === false && json?.errorType === "METAFIELD_SET_ERRORS") {
-        setMfError({ ...json, magentoProductId: item.magentoProductId, name: item.name });
-        setIsBulkSyncing(false);
-        return; // ✅ dừng luôn (tuỳ bạn)
-      }
+      await submitBulkProduct(item, "sync");
       setProgress((p) => ({ ...p, done: p.done + 1 }));
     }
 
@@ -1334,21 +850,19 @@ export default function ProductPage() {
     if (!s) return null;
     if (!Number.isFinite(n)) return null;
 
-    const p = Math.max(1, Math.min(total, Math.trunc(n)));
-    return p;
+    return Math.max(1, Math.min(total, Math.trunc(n)));
   };
 
   const goToPage = (raw) => {
     const p = normalizePage(raw);
+
     if (p == null) {
-      // nhập bậy thì reset về trang hiện tại
       setPageInput(String(pageInfo.page ?? 1));
       return;
     }
 
     const current = Number(pageInfo.page ?? 1);
     if (p === current) {
-      // không đổi gì thì đừng fetch
       setPageInput(String(current));
       return;
     }
@@ -1357,83 +871,82 @@ export default function ProductPage() {
     handleFetch(p);
   };
 
-
   return (
     <Page title="Magento → Shopify Products">
-      {mfError && (
-        <Banner
-          title="Metafield sync errors"
-          tone="critical"
-          onDismiss={() => setMfError(null)}
-        >
-          <p>Some metafields failed to set. Details:</p>
-          <ul>
-            {(mfError.debugErrors ?? []).slice(0, 15).map((e, idx) => (
-              <li key={idx}>
-                <strong>{e.namespace}.{e.key}</strong> ({e.type}) — {e.message}
-                <div style={{ opacity: 0.8 }}>
-                  value: <code>{e.value}</code>
-                </div>
-              </li>
-            ))}
-          </ul>
-          {(mfError.debugErrors?.length ?? 0) > 15 && (
-            <p>Showing first 15 errors. Total: {mfError.debugErrors.length}</p>
-          )}
-        </Banner>
-      )}
-
       <BlockStack gap="400">
         <Card>
-          <InlineStack align="space-between">
-             <div style={{ width: 260 }}>
+          <BlockStack gap="300">
+            <InlineStack align="space-between">
+              <div style={{ width: 260 }}>
                 <TextField
                   labelHidden
                   label="product id"
                   placeholder="product id"
                   value={searchId}
                   onChange={(v) => setSearchId(v)}
-                  autoComplete="off" 
+                  autoComplete="off"
                 />
               </div>
+
+              <InlineStack gap="200">
+                <Button
+                  onClick={() => handleFetch(page)}
+                  loading={fetcher.state !== "idle"}
+                  disabled={isBulkSyncing || syncingUrls}
+                >
+                  Fetch products
+                </Button>
+
+                <Button
+                  variant="primary"
+                  onClick={syncAll}
+                  loading={isBulkSyncing}
+                  disabled={allSynced || isBulkSyncing || syncingUrls}
+                >
+                  Sync all
+                </Button>
+
+                <Button
+                  variant="secondary"
+                  onClick={resyncAll}
+                  loading={isBulkSyncing}
+                  disabled={allResynced || isBulkSyncing || syncingUrls}
+                >
+                  Re-sync all
+                </Button>
+              </InlineStack>
+            </InlineStack>
+
             <InlineStack gap="200">
               <Button
-                onClick={() => handleFetch(page)}
-                loading={fetcher.state !== "idle"}
-                disabled={isBulkSyncing}
+                variant="secondary"
+                onClick={syncProductUrls}
+                loading={syncingUrls}
+                disabled={items.length === 0 || isBulkSyncing || syncingUrls}
               >
-                Fetch products
-              </Button>
-
-              <Button
-                variant="primary"
-                onClick={syncAll}
-                loading={isBulkSyncing}
-                disabled={allSynced || isBulkSyncing}
-              >
-                Sync all
+                Sync product URLs
               </Button>
 
               <Button
                 variant="secondary"
-                onClick={resyncAll}
-                loading={isBulkSyncing}
-                disabled={allResynced || isBulkSyncing}
-              > 
-                Re-sync all
+                onClick={handleExportRedirectCsv}
+                disabled={items.length === 0 || isBulkSyncing || syncingUrls}
+              >
+                Export CSV
               </Button>
             </InlineStack>
-          </InlineStack>
 
-          {isBulkSyncing && (
-            <BlockStack gap="200">
-              <Text>
-                Syncing {progress.done} / {progress.total}
-              </Text>
-              <ProgressBar progress={(progress.done / progress.total) * 100} />
-            </BlockStack>
-          )}
+            {isBulkSyncing && (
+              <BlockStack gap="200">
+                <Text>
+                  Syncing {progress.done} / {progress.total}
+                </Text>
+                <ProgressBar progress={(progress.done / progress.total) * 100} />
+              </BlockStack>
+            )}
+          </BlockStack>
         </Card>
+
         {fetcher.data?.total_page > 1 && (
           <Card>
             <InlineStack align="space-between" blockAlign="center">
@@ -1442,28 +955,29 @@ export default function ProductPage() {
 
                 <div style={{ width: 90 }}>
                   <TextField
-                      labelHidden
-                      label="page"
-                      value={pageInput}
-                      onChange={setPageInput}
-                      autoComplete="off"
-                      onFocus={() => setPageInputFocusValue(pageInput)}
-                      onBlur={() => {
-                        // nếu user không đổi text thì thôi
-                        if (pageInput === pageInputFocusValue) return;
+                    labelHidden
+                    label="page"
+                    value={pageInput}
+                    onChange={setPageInput}
+                    autoComplete="off"
+                    onFocus={() => setPageInputFocusValue(pageInput)}
+                    onBlur={() => {
+                      if (pageInput === pageInputFocusValue) return;
+                      goToPage(pageInput);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
                         goToPage(pageInput);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          goToPage(pageInput);
-                          e.currentTarget.blur(); // optional: blur để đóng focus
-                        }
-                      }}
-                    />
+                        e.currentTarget.blur();
+                      }
+                    }}
+                  />
                 </div>
 
-                <Text>/ {pageInfo.totalPage} — Total {pageInfo.total} items</Text>
+                <Text>
+                  / {pageInfo.totalPage} — Total {pageInfo.total} items
+                </Text>
               </InlineStack>
 
               <Pagination
@@ -1473,9 +987,9 @@ export default function ProductPage() {
                 onNext={() => handleFetch(pageInfo.page + 1)}
               />
             </InlineStack>
-
           </Card>
         )}
+
         {items.length > 0 && (
           <Card padding="0">
             <Scrollable style={{ height: "600px" }}>
@@ -1487,6 +1001,10 @@ export default function ProductPage() {
                   { title: "Shopify Product ID" },
                   { title: "Magento Product ID" },
                   { title: "Name" },
+                  { title: "Price" },
+                  { title: "Qty" },
+                  { title: "Redirect from" },
+                  { title: "Redirect to" },
                   { title: "Action" },
                 ]}
               >
@@ -1503,13 +1021,15 @@ export default function ProductPage() {
                         <Text>{item.name}</Text>
                       </div>
                     </IndexTable.Cell>
+                    <IndexTable.Cell>{item.price ?? "-"}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.qty ?? "-"}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.redirectFrom || "-"}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.redirectTo || "-"}</IndexTable.Cell>
                     <IndexTable.Cell>
                       <RowActions
                         item={item}
-                        onDone={() => handleFetch(page)} 
-                        disabled={isBulkSyncing}
-                        onError={(data) => setMfError(data)} 
-                        onClearError={() => setMfError(null)}
+                        onDone={() => handleFetch(page)}
+                        disabled={isBulkSyncing || syncingUrls}
                         shopify={shopify}
                       />
                     </IndexTable.Cell>
