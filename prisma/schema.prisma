@@ -51,6 +51,9 @@ model CollectionMapCategory {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
+  redirectFrom      String?
+  redirectTo        String?
+
   @@index([magentoCategoryId])
 }
 

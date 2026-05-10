@@ -58,12 +58,67 @@ function asString(value, fallback = "") {
   return String(value);
 }
 
+function normalizePath(value) {
+  const raw = asString(value).trim();
+  if (!raw) return "";
+
+  try {
+    if (raw.startsWith("http://") || raw.startsWith("https://")) {
+      return new URL(raw).pathname;
+    }
+  } catch {
+    // keep raw path below
+  }
+
+  return raw.startsWith("/") ? raw : `/${raw}`;
+}
+
+function buildCollectionRedirectFrom(urlPath) {
+  return normalizePath(urlPath);
+}
+
+function buildCollectionRedirectTo(handle) {
+  const h = asString(handle).trim();
+  return h ? `/collections/${h}` : "";
+}
+
 // Magento image helpers
-const MAGENTO_BASE_URL = "https://www.megagastrostore.de";
+const MAGENTO_BASE_URL = "https://megagas.site";
 function buildMagentoImageUrl(imagePath) {
   if (!imagePath) return null;
   if (imagePath.startsWith("http")) return imagePath;
   return `${MAGENTO_BASE_URL}${imagePath}`;
+}
+
+async function getShopifyCollectionHandles(admin, collectionIds) {
+  const uniqueIds = [...new Set(collectionIds.filter(Boolean))];
+  const handleMap = new Map();
+
+  for (const ids of chunk(uniqueIds, 100)) {
+    const res = await admin.graphql(
+      `#graphql
+      query GetCollections($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Collection {
+            id
+            handle
+          }
+        }
+      }`,
+      { variables: { ids } }
+    );
+
+    const json = await res.json();
+    const nodes = json?.data?.nodes ?? [];
+
+    for (const node of nodes) {
+      if (node?.id && node?.handle) {
+        handleMap.set(node.id, node.handle);
+      }
+    }
+  }
+
+  return handleMap;
 }
 
 /**
@@ -143,22 +198,91 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  const intentsNeedMagento = new Set(["fetch", "sync", "resync", "sync_products"]);
-    let MAGENTO_BASE = null;
-  
-    if (intentsNeedMagento.has(intent)) {
-      MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
-  
-      if (!MAGENTO_BASE) {
-        return {
-          success: false,
-          error: "PLEASE_SETUP_MAGENTO_URL",
-          message: "Please setup url",
-        };
-      }
+  const intentsNeedMagento = new Set([
+    "fetch",
+    "sync",
+    "resync",
+    "sync_products",
+    "sync_category_redirects",
+  ]);
+  let MAGENTO_BASE = null;
+
+  if (intentsNeedMagento.has(intent)) {
+    MAGENTO_BASE = String(await getSettingOr("magento_url", "")).trim();
+
+    if (!MAGENTO_BASE) {
+      return {
+        success: false,
+        error: "PLEASE_SETUP_MAGENTO_URL",
+        message: "Please setup url",
+      };
+    }
+  }
+
+  /**
+   * SYNC CATEGORY REDIRECT PATHS
+   * Lấy url_path từ Magento và handle từ Shopify collection, sau đó lưu:
+   * redirectFrom = /magento/category/path
+   * redirectTo   = /collections/shopify-handle
+   */
+  if (intent === "sync_category_redirects") {
+    const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/categories`);
+
+    if (!res.ok) {
+      throw new Response("Failed to fetch Magento categories", { status: 500 });
     }
 
-  // sync product
+    const magentoData = await res.json();
+    const magentoItems = magentoData?.items ?? [];
+
+    const magentoById = new Map(
+      magentoItems.map((cat) => [Number(cat.category_id), cat])
+    );
+
+    const mapped = await prisma.collectionMapCategory.findMany({
+      select: {
+        collectionId: true,
+        magentoCategoryId: true,
+      },
+    });
+
+    const handleMap = await getShopifyCollectionHandles(
+      admin,
+      mapped.map((m) => m.collectionId)
+    );
+
+    let updated = 0;
+    let skipped = 0;
+
+    for (const map of mapped) {
+      const magentoCat = magentoById.get(Number(map.magentoCategoryId));
+      const handle = handleMap.get(map.collectionId);
+
+      const redirectFrom = buildCollectionRedirectFrom(magentoCat?.url_path);
+      const redirectTo = buildCollectionRedirectTo(handle);
+
+      if (!redirectFrom || !redirectTo) {
+        skipped += 1;
+        continue;
+      }
+
+      await prisma.collectionMapCategory.update({
+        where: { collectionId: map.collectionId },
+        data: {
+          redirectFrom,
+          redirectTo,
+        },
+      });
+
+      updated += 1;
+    }
+
+    return { success: true, updated, skipped };
+  }
+
+  /**
+   * SYNC PRODUCTS TO COLLECTION
+   */
   if (intent === "sync_products") {
     const magentoCategoryId = asInt(formData.get("magentoCategoryId"));
     const collectionId = asString(formData.get("collectionId"));
@@ -222,13 +346,12 @@ export const action = async ({ request }) => {
       jobs,
     };
   }
+
   /**
    * FETCH MAGENTO CATEGORIES
    */
   if (intent === "fetch") {
-    const res = await fetch(
-      `${MAGENTO_BASE}/rest/V1/shopify/categories`
-    );
+    const res = await fetch(`${MAGENTO_BASE}/rest/V1/shopify/categories`);
 
     if (!res.ok) {
       throw new Response("Failed to fetch Magento categories", { status: 500 });
@@ -250,7 +373,11 @@ export const action = async ({ request }) => {
         shopifyCollectionId: map?.collectionId ?? null,
         isSynced: Boolean(map),
 
+        redirectFrom: map?.redirectFrom ?? buildCollectionRedirectFrom(cat.url_path),
+        redirectTo: map?.redirectTo ?? "",
+
         image: cat.image,
+        urlPath: cat.url_path,
         metaTitle: cat.meta_title,
         metaDescription: cat.meta_description,
         description: cat.description,
@@ -274,6 +401,9 @@ export const action = async ({ request }) => {
     const imagePath = asString(formData.get("image"));
     const imageSrc = buildMagentoImageUrl(imagePath);
 
+    const redirectFrom = normalizePath(formData.get("redirectFrom"));
+    const redirectToFromForm = normalizePath(formData.get("redirectTo"));
+
     if (!magentoCategoryId || !name) {
       throw new Response("Missing required fields", { status: 400 });
     }
@@ -296,7 +426,7 @@ export const action = async ({ request }) => {
         `#graphql
         mutation CreateCollection($input: CollectionInput!) {
           collectionCreate(input: $input) {
-            collection { id }
+            collection { id handle }
             userErrors { message }
           }
         }`,
@@ -311,8 +441,10 @@ export const action = async ({ request }) => {
       }
 
       const collectionId = payload.collection.id;
+      const collectionHandle = payload.collection.handle;
+      const redirectTo = redirectToFromForm || buildCollectionRedirectTo(collectionHandle);
 
-      // 🔥 PUBLISH COLLECTION
+      // PUBLISH COLLECTION
       await publishCollection(admin, collectionId);
 
       await prisma.collectionMapCategory.create({
@@ -320,6 +452,8 @@ export const action = async ({ request }) => {
           magentoCategoryId,
           name,
           collectionId,
+          redirectFrom,
+          redirectTo,
         },
       });
 
@@ -338,7 +472,7 @@ export const action = async ({ request }) => {
       `#graphql
       mutation UpdateCollection($input: CollectionInput!) {
         collectionUpdate(input: $input) {
-          collection { id }
+          collection { id handle }
           userErrors { message }
         }
       }`,
@@ -356,12 +490,19 @@ export const action = async ({ request }) => {
       throw new Error(payload.userErrors[0].message);
     }
 
-    // 🔥 ENSURE PUBLISHED
+    const collectionHandle = payload.collection?.handle;
+    const redirectTo = redirectToFromForm || buildCollectionRedirectTo(collectionHandle);
+
+    // ENSURE PUBLISHED
     await publishCollection(admin, collectionId);
 
     await prisma.collectionMapCategory.update({
       where: { collectionId },
-      data: { name },
+      data: {
+        name,
+        redirectFrom,
+        redirectTo,
+      },
     });
 
     return { success: true };
@@ -418,6 +559,8 @@ function RowActions({ item, onDone, disabled, shopify }) {
       <input type="hidden" name="metaTitle" value={asString(item.metaTitle)} />
       <input type="hidden" name="metaDescription" value={asString(item.metaDescription)} />
       <input type="hidden" name="description" value={asString(item.description)} />
+      <input type="hidden" name="redirectFrom" value={asString(item.redirectFrom)} />
+      <input type="hidden" name="redirectTo" value={asString(item.redirectTo)} />
     </>
   );
 
@@ -450,6 +593,7 @@ function RowActions({ item, onDone, disabled, shopify }) {
           Re-sync
         </Button>
       </resyncFetcher.Form>
+
       <syncProductsFetcher.Form method="post">
         <input type="hidden" name="intent" value="sync_products" />
         <input type="hidden" name="magentoCategoryId" value={item.magentoCategoryId} />
@@ -461,7 +605,7 @@ function RowActions({ item, onDone, disabled, shopify }) {
           loading={syncingProducts}
           disabled={
             disabled ||
-            !item.shopifyCollectionId || // ✅ chỉ khi category đã sync
+            !item.shopifyCollectionId ||
             syncing ||
             resyncing ||
             syncingProducts
@@ -476,6 +620,7 @@ function RowActions({ item, onDone, disabled, shopify }) {
 
 export default function CategorySyncPage() {
   const fetcher = useFetcher();
+  const syncRedirectsFetcher = useFetcher();
   const shopify = useAppBridge();
 
   const [isBulkSyncing, setIsBulkSyncing] = useState(false);
@@ -484,10 +629,10 @@ export default function CategorySyncPage() {
   const [isBulkProductSyncing, setIsBulkProductSyncing] = useState(false);
   const [productProgress, setProductProgress] = useState({ done: 0, total: 0 });
 
-
   const items = fetcher.data?.items ?? [];
   const unsyncedItems = items.filter((i) => !i.isSynced);
   const allSynced = unsyncedItems.length === 0;
+  const syncingRedirects = syncRedirectsFetcher.state !== "idle";
 
   const handleFetch = () => {
     fetcher.submit({ intent: "fetch" }, { method: "POST" });
@@ -497,6 +642,22 @@ export default function CategorySyncPage() {
     const t = setTimeout(handleFetch, 200);
     return () => clearTimeout(t);
   }, []);
+
+  useEffect(() => {
+    if (syncRedirectsFetcher.state === "idle" && syncRedirectsFetcher.data?.success) {
+      const updated = Number(syncRedirectsFetcher.data?.updated || 0);
+      const skipped = Number(syncRedirectsFetcher.data?.skipped || 0);
+      shopify.toast.show(`Synced category URLs: ${updated} updated, ${skipped} skipped`);
+      handleFetch();
+    }
+  }, [syncRedirectsFetcher.state]);
+
+  const handleSyncCategoryRedirects = () => {
+    syncRedirectsFetcher.submit(
+      { intent: "sync_category_redirects" },
+      { method: "POST" }
+    );
+  };
 
   const syncAllProducts = async () => {
     const syncedCategories = items.filter(
@@ -541,6 +702,8 @@ export default function CategorySyncPage() {
       fd.append("metaTitle", item.metaTitle || "");
       fd.append("metaDescription", item.metaDescription || "");
       fd.append("description", item.description || "");
+      fd.append("redirectFrom", item.redirectFrom || "");
+      fd.append("redirectTo", item.redirectTo || "");
 
       await fetch(window.location.pathname, {
         method: "POST",
@@ -559,58 +722,72 @@ export default function CategorySyncPage() {
     <Page title="Category Sync">
       <BlockStack gap="400">
         <Card>
-          <InlineStack align="space-between">
-            <Text variant="headingSm">Magento → Shopify Categories</Text>
+          <BlockStack gap="300">
+            <InlineStack align="space-between">
+              <Text variant="headingSm">Magento → Shopify Categories</Text>
+
+              <InlineStack gap="200">
+                <Button
+                  onClick={handleFetch}
+                  loading={fetcher.state !== "idle"}
+                  disabled={isBulkSyncing || syncingRedirects}
+                >
+                  Fetch categories
+                </Button>
+
+                <Button
+                  variant="primary"
+                  onClick={syncAll}
+                  loading={isBulkSyncing}
+                  disabled={allSynced || isBulkSyncing || syncingRedirects}
+                >
+                  Sync all
+                </Button>
+              </InlineStack>
+            </InlineStack>
 
             <InlineStack gap="200">
               <Button
-                onClick={handleFetch}
-                loading={fetcher.state !== "idle"}
-                disabled={isBulkSyncing}
+                variant="secondary"
+                onClick={syncAllProducts}
+                loading={isBulkProductSyncing}
+                disabled={items.length === 0 || isBulkSyncing || syncingRedirects}
               >
-                Fetch categories
+                Sync all products
               </Button>
 
               <Button
-                variant="primary"
-                onClick={syncAll}
-                loading={isBulkSyncing}
-                disabled={allSynced || isBulkSyncing}
+                variant="secondary"
+                onClick={handleSyncCategoryRedirects}
+                loading={syncingRedirects}
+                disabled={items.length === 0 || isBulkSyncing || isBulkProductSyncing}
               >
-                Sync all
+                Sync category URLs
               </Button>
             </InlineStack>
-          </InlineStack>
-          <Button
-            variant="secondary"
-            onClick={syncAllProducts}
-            loading={isBulkProductSyncing}
-            disabled={items.length === 0 || isBulkSyncing}
-          >
-            Sync all products
-          </Button>
-          {isBulkSyncing && (
-            <BlockStack gap="200">
-              <Text>
-                Syncing {progress.done} / {progress.total}
-              </Text>
-              <ProgressBar progress={(progress.done / progress.total) * 100} />
-            </BlockStack>
-          )}
 
-          {isBulkProductSyncing && (
-            <BlockStack gap="200">
-              <Text>
-                Syncing products {productProgress.done} / {productProgress.total}
-              </Text>
-              <ProgressBar
-                progress={
-                  (productProgress.done / productProgress.total) * 100
-                }
-              />
-            </BlockStack>
-          )}
+            {isBulkSyncing && (
+              <BlockStack gap="200">
+                <Text>
+                  Syncing {progress.done} / {progress.total}
+                </Text>
+                <ProgressBar progress={(progress.done / progress.total) * 100} />
+              </BlockStack>
+            )}
 
+            {isBulkProductSyncing && (
+              <BlockStack gap="200">
+                <Text>
+                  Syncing products {productProgress.done} / {productProgress.total}
+                </Text>
+                <ProgressBar
+                  progress={
+                    (productProgress.done / productProgress.total) * 100
+                  }
+                />
+              </BlockStack>
+            )}
+          </BlockStack>
         </Card>
 
         {items.length > 0 && (
@@ -624,6 +801,8 @@ export default function CategorySyncPage() {
                   { title: "Shopify Collection ID" },
                   { title: "Magento Category ID" },
                   { title: "Name" },
+                  { title: "Redirect from" },
+                  { title: "Redirect to" },
                   { title: "Action" },
                 ]}
               >
@@ -638,11 +817,13 @@ export default function CategorySyncPage() {
                     </IndexTable.Cell>
                     <IndexTable.Cell>{item.magentoCategoryId}</IndexTable.Cell>
                     <IndexTable.Cell>{item.name}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.redirectFrom || "-"}</IndexTable.Cell>
+                    <IndexTable.Cell>{item.redirectTo || "-"}</IndexTable.Cell>
                     <IndexTable.Cell>
                       <RowActions
                         item={item}
                         onDone={handleFetch}
-                        disabled={isBulkSyncing}
+                        disabled={isBulkSyncing || syncingRedirects}
                         shopify={shopify}
                       />
                     </IndexTable.Cell>
