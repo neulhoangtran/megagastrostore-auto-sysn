@@ -88,10 +88,10 @@ function downloadRedirectCsv(items) {
     .filter((item) => item.redirectFrom && item.redirectTo)
     .map((item) => [item.redirectFrom, item.redirectTo]);
 
+  const newline = String.fromCharCode(10);
   const csv = [["Redirect from", "Redirect to"], ...rows]
     .map((row) => row.map(escapeCsvCell).join(","))
-    .join("
-");
+    .join(newline);
 
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = window.URL.createObjectURL(blob);
