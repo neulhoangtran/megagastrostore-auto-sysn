@@ -82,6 +82,40 @@ function buildCollectionRedirectTo(handle) {
   return h ? `/collections/${h}` : "";
 }
 
+function escapeCsvCell(value) {
+  const text = asString(value);
+  if (/[",
+
+]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
+function downloadRedirectCsv(items) {
+  const rows = items
+    .filter((item) => item.redirectFrom && item.redirectTo)
+    .map((item) => [item.redirectFrom, item.redirectTo]);
+
+  const csv = [
+    ["Redirect from", "Redirect to"],
+    ...rows,
+  ]
+    .map((row) => row.map(escapeCsvCell).join(","))
+    .join("
+");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "shopify-category-redirects.csv";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
 // Magento image helpers
 const MAGENTO_BASE_URL = "https://megagas.site";
 function buildMagentoImageUrl(imagePath) {
@@ -767,6 +801,11 @@ export default function CategorySyncPage() {
     );
   };
 
+  const handleExportRedirectCsv = () => {
+    downloadRedirectCsv(items);
+    shopify.toast.show("Redirect CSV exported");
+  };
+
   const syncAllProducts = async () => {
     const syncedCategories = items.filter(
       (i) => i.isSynced && i.shopifyCollectionId
@@ -880,6 +919,20 @@ export default function CategorySyncPage() {
                 disabled={items.length === 0 || isBulkSyncing || isBulkProductSyncing || syncingRedirects}
               >
                 Push Shopify redirects
+              </Button>
+
+              <Button
+                variant="secondary"
+                onClick={handleExportRedirectCsv}
+                disabled={
+                  items.length === 0 ||
+                  isBulkSyncing ||
+                  isBulkProductSyncing ||
+                  syncingRedirects ||
+                  pushingRedirects
+                }
+              >
+                Export CSV
               </Button>
             </InlineStack>
 
