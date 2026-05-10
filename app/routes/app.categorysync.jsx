@@ -182,6 +182,43 @@ async function publishCollection(admin, collectionId) {
   }
 }
 
+async function createShopifyUrlRedirect(admin, { path, target }) {
+  const res = await admin.graphql(
+    `#graphql
+    mutation CreateUrlRedirect($urlRedirect: UrlRedirectInput!) {
+      urlRedirectCreate(urlRedirect: $urlRedirect) {
+        urlRedirect {
+          id
+          path
+          target
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }`,
+    {
+      variables: {
+        urlRedirect: {
+          path,
+          target,
+        },
+      },
+    }
+  );
+
+  const json = await res.json();
+  const payload = json?.data?.urlRedirectCreate;
+  const errors = payload?.userErrors ?? [];
+
+  if (errors.length > 0) {
+    throw new Error(errors[0].message);
+  }
+
+  return payload?.urlRedirect ?? null;
+}
+
 /**
  * ======================
  * SERVER
@@ -204,6 +241,7 @@ export const action = async ({ request }) => {
     "resync",
     "sync_products",
     "sync_category_redirects",
+    "push_shopify_category_redirects",
   ]);
   let MAGENTO_BASE = null;
 
@@ -278,6 +316,59 @@ export const action = async ({ request }) => {
     }
 
     return { success: true, updated, skipped };
+  }
+
+  /**
+   * PUSH CATEGORY REDIRECTS TO SHOPIFY
+   * Tạo URL redirects trong Shopify từ dữ liệu đã lưu ở DB:
+   * redirectFrom -> redirectTo
+   */
+  if (intent === "push_shopify_category_redirects") {
+    const rows = await prisma.collectionMapCategory.findMany({
+      where: {
+        redirectFrom: { not: null },
+        redirectTo: { not: null },
+      },
+      select: {
+        id: true,
+        redirectFrom: true,
+        redirectTo: true,
+      },
+    });
+
+    let created = 0;
+    let failed = 0;
+    const errors = [];
+
+    for (const row of rows) {
+      const path = normalizePath(row.redirectFrom);
+      const target = normalizePath(row.redirectTo);
+
+      if (!path || !target || path === target) {
+        continue;
+      }
+
+      try {
+        await createShopifyUrlRedirect(admin, { path, target });
+        created += 1;
+      } catch (error) {
+        failed += 1;
+        errors.push({
+          id: row.id,
+          path,
+          target,
+          message: error?.message || "Unknown error",
+        });
+      }
+    }
+
+    return {
+      success: true,
+      total: rows.length,
+      created,
+      failed,
+      errors: errors.slice(0, 10),
+    };
   }
 
   /**
@@ -621,6 +712,7 @@ function RowActions({ item, onDone, disabled, shopify }) {
 export default function CategorySyncPage() {
   const fetcher = useFetcher();
   const syncRedirectsFetcher = useFetcher();
+  const pushRedirectsFetcher = useFetcher();
   const shopify = useAppBridge();
 
   const [isBulkSyncing, setIsBulkSyncing] = useState(false);
@@ -633,6 +725,7 @@ export default function CategorySyncPage() {
   const unsyncedItems = items.filter((i) => !i.isSynced);
   const allSynced = unsyncedItems.length === 0;
   const syncingRedirects = syncRedirectsFetcher.state !== "idle";
+  const pushingRedirects = pushRedirectsFetcher.state !== "idle";
 
   const handleFetch = () => {
     fetcher.submit({ intent: "fetch" }, { method: "POST" });
@@ -652,9 +745,24 @@ export default function CategorySyncPage() {
     }
   }, [syncRedirectsFetcher.state]);
 
+  useEffect(() => {
+    if (pushRedirectsFetcher.state === "idle" && pushRedirectsFetcher.data?.success) {
+      const created = Number(pushRedirectsFetcher.data?.created || 0);
+      const failed = Number(pushRedirectsFetcher.data?.failed || 0);
+      shopify.toast.show(`Pushed redirects: ${created} created, ${failed} failed`);
+    }
+  }, [pushRedirectsFetcher.state]);
+
   const handleSyncCategoryRedirects = () => {
     syncRedirectsFetcher.submit(
       { intent: "sync_category_redirects" },
+      { method: "POST" }
+    );
+  };
+
+  const handlePushShopifyRedirects = () => {
+    pushRedirectsFetcher.submit(
+      { intent: "push_shopify_category_redirects" },
       { method: "POST" }
     );
   };
@@ -730,7 +838,7 @@ export default function CategorySyncPage() {
                 <Button
                   onClick={handleFetch}
                   loading={fetcher.state !== "idle"}
-                  disabled={isBulkSyncing || syncingRedirects}
+                  disabled={isBulkSyncing || syncingRedirects || pushingRedirects}
                 >
                   Fetch categories
                 </Button>
@@ -739,7 +847,7 @@ export default function CategorySyncPage() {
                   variant="primary"
                   onClick={syncAll}
                   loading={isBulkSyncing}
-                  disabled={allSynced || isBulkSyncing || syncingRedirects}
+                  disabled={allSynced || isBulkSyncing || syncingRedirects || pushingRedirects}
                 >
                   Sync all
                 </Button>
@@ -751,7 +859,7 @@ export default function CategorySyncPage() {
                 variant="secondary"
                 onClick={syncAllProducts}
                 loading={isBulkProductSyncing}
-                disabled={items.length === 0 || isBulkSyncing || syncingRedirects}
+                disabled={items.length === 0 || isBulkSyncing || syncingRedirects || pushingRedirects}
               >
                 Sync all products
               </Button>
@@ -760,9 +868,18 @@ export default function CategorySyncPage() {
                 variant="secondary"
                 onClick={handleSyncCategoryRedirects}
                 loading={syncingRedirects}
-                disabled={items.length === 0 || isBulkSyncing || isBulkProductSyncing}
+                disabled={items.length === 0 || isBulkSyncing || isBulkProductSyncing || pushingRedirects}
               >
                 Sync category URLs
+              </Button>
+
+              <Button
+                variant="primary"
+                onClick={handlePushShopifyRedirects}
+                loading={pushingRedirects}
+                disabled={items.length === 0 || isBulkSyncing || isBulkProductSyncing || syncingRedirects}
+              >
+                Push Shopify redirects
               </Button>
             </InlineStack>
 
@@ -823,7 +940,7 @@ export default function CategorySyncPage() {
                       <RowActions
                         item={item}
                         onDone={handleFetch}
-                        disabled={isBulkSyncing || syncingRedirects}
+                        disabled={isBulkSyncing || syncingRedirects || pushingRedirects}
                         shopify={shopify}
                       />
                     </IndexTable.Cell>
