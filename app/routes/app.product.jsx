@@ -55,8 +55,12 @@ function normalizePath(value) {
   return raw.startsWith("/") ? raw : `/${raw}`;
 }
 
-function buildProductRedirectFrom(urlPath, urlKey) {
-  return normalizePath(urlPath || urlKey || "");
+function buildProductRedirectFrom(urlKey) {
+  const key = asString(urlKey).trim();
+  if (!key) return "";
+
+  const path = key.endsWith(".html") ? key : `${key}.html`;
+  return normalizePath(path);
 }
 
 function buildProductRedirectTo(handle) {
@@ -485,13 +489,12 @@ export const action = async ({ request }) => {
         sku: p.sku,
         price: p.special_price ?? p.price,
         qty: p.salable_qty ?? p.qty ?? 0,
-        urlPath: p.url_path,
         urlKey: p.url_key,
 
         shopifyProductId: map?.shopifyProductId ?? null,
         isSynced: Boolean(map),
 
-        redirectFrom: map?.redirectFrom ?? buildProductRedirectFrom(p.url_path, p.url_key),
+        redirectFrom: map?.redirectFrom ?? buildProductRedirectFrom(p.url_key),
         redirectTo: map?.redirectTo ?? buildProductRedirectTo(shopifyHandle),
       };
     });
@@ -546,10 +549,7 @@ export const action = async ({ request }) => {
       const magentoProduct = magentoById.get(Number(map.magentoProductId));
       const shopifyHandle = handleMap.get(map.shopifyProductId);
 
-      const redirectFrom = buildProductRedirectFrom(
-        magentoProduct?.url_path,
-        magentoProduct?.url_key
-      );
+      const redirectFrom = buildProductRedirectFrom(magentoProduct?.url_key);
       const redirectTo = buildProductRedirectTo(shopifyHandle);
 
       if (!redirectFrom || !redirectTo) {
