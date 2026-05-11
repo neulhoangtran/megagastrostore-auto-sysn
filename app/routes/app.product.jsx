@@ -59,8 +59,7 @@ function buildProductRedirectFrom(urlKey) {
   const key = asString(urlKey).trim();
   if (!key) return "";
 
-  const path = key.endsWith(".html") ? key : `${key}.html`;
-  return normalizePath(path);
+  return normalizePath(key);
 }
 
 function buildProductRedirectTo(handle) {
